@@ -1,0 +1,52 @@
+[package]
+name = "td-loader-fuzz"
+version = "0.0.0"
+authors = ["Automatically generated"]
+publish = false
+edition = "2018"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = {version = "0.4", optional = true }
+afl = {version = "*", optional = true }
+log = "0.4.13"
+arbitrary = "=1.1.3"
+serde = "=1.0.198"
+
+[dependencies.td-loader]
+path = ".."
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[features]
+default = ["libfuzzer-sys"]
+fuzz = ["afl"]
+
+[[bin]]
+name = "pe"
+path = "fuzz_targets/pe.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "elf"
+path = "fuzz_targets/elf.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "afl_pe"
+path = "fuzz_targets/afl_pe.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "afl_elf"
+path = "fuzz_targets/afl_elf.rs"
+test = false
+doc = false
+

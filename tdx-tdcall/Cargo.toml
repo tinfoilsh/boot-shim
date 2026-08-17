@@ -1,0 +1,27 @@
+[package]
+name = "tdx-tdcall"
+version = "0.2.3"
+description = "Constants, stuctures and wrappers to access TDCALL services"
+repository = "https://github.com/confidential-containers/td-shim"
+homepage = "https://github.com/confidential-containers"
+license = "BSD-2-Clause-Patent"
+edition = "2018"
+
+readme = "README.md"
+keywords = ["TDCALL", "TDX", "intel"]
+
+[dependencies]
+cfg-if = "1.0.0"
+lazy_static = { version = "1.0", features = ["spin_no_std"] }
+log = "0.4.13"
+scroll = { version = "0.10", default-features = false, features = ["derive"] }
+spin = "0.9.2"
+x86_64 = { version = "0.14.9", default-features = false, features = ["instructions"] }
+bitfield-struct = "0.11"
+
+[features]
+default = []
+use_tdx_emulation = []
+no-tdvmcall = []
+no-tdaccept = []
+tdg_dbg = []

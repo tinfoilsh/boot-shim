@@ -1,0 +1,55 @@
+[package]
+name = "td-payload"
+version = "0.1.0"
+description = "A sample TD module/driver for TDX hardware platforms"
+repository = "https://github.com/confidential-containers/td-shim"
+homepage = "https://github.com/confidential-containers"
+license = "BSD-2-Clause-Patent"
+edition = "2018"
+
+[[bin]]
+name = "example"
+required-features = ["start"]
+
+[dependencies]
+bit_field = "0.10"
+linked_list_allocator = "0.10"
+lazy_static = "1.0"
+log = "0.4.13"
+r-efi = "3.2.0"
+scroll = { version = "0.10", default-features = false, features = ["derive"]}
+serde = { version = "1.0", default-features = false, features = ["derive"]}
+serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
+spin = "0.9"
+td-layout = { path = "../td-layout" }
+td-logger =  { path = "../td-logger" }
+td-shim = { path = "../td-shim", default-features = false }
+td-shim-interface =  { path = "../td-shim-interface" }
+td-exception =  { path = "../td-exception" }
+td-paging =  { path = "../td-paging" }
+x86 = "0.47.0"
+x86_64 = { version = "0.14.9", default-features = false, features = ["instructions"] }
+td-benchmark = { path = "../devtools/td-benchmark", optional = true }
+tdx-tdcall = { path = "../tdx-tdcall", optional = true }
+zerocopy = { version = "=0.8.27", features = ["derive"] }
+
+minicov = { version = "0.2", default-features = false, optional = true }
+
+[features]
+default = ["tdx"]
+tdx = ["tdx-tdcall", "td-logger/tdx", "td-exception/tdx"]
+stack-guard = []
+cet-shstk = ["td-exception/cet-shstk"]
+cet-ibt = []
+no-td-hob = ["td-shim/no-td-hob"]
+no-acpi-ccel = ["td-shim/no-acpi-ccel"]
+start = []
+benches = ["td-benchmark"]
+coverage = ["minicov"]
+test_heap_size = ["td-benchmark"]
+no-tdvmcall = ["td-shim/no-tdvmcall", "tdx-tdcall/no-tdvmcall", "td-exception/no-tdvmcall", "td-logger/no-tdvmcall"]
+no-tdaccept = ["td-shim/no-tdaccept", "tdx-tdcall/no-tdaccept"]
+no-shared-mem = []
+no-mailbox = ["td-shim/no-mailbox"]
+no-config = ["td-shim/no-config"]
+no-interrupt = ["td-exception/no-interrupt"]

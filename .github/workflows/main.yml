@@ -1,0 +1,99 @@
+on:
+  push:
+    paths-ignore:
+      - "**.md"
+  pull_request:
+    paths-ignore:
+      - "**.md"
+  workflow_dispatch:
+
+name: Build
+
+env:
+  AS: nasm
+  AR_x86_64_unknown_linux_gnu: llvm-ar
+  CC_x86_64_unknown_linux_gnu: clang
+  AR_x86_64_unknown_none: llvm-ar
+  CC_x86_64_unknown_none: clang
+  RUST_TOOLCHAIN: 1.88.0
+  TOOLCHAIN_PROFILE: minimal
+
+jobs:
+  system_compile:
+    name: Compile the final.bin file
+    runs-on: ${{ matrix.host_os }}
+    timeout-minutes: 30
+
+    strategy:
+      matrix:
+        host_os:
+          - ubuntu-22.04
+          - windows-2022
+    steps:
+      # Install first since it's needed to build NASM
+      - name: Install LLVM and Clang
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: "10.0"
+          directory: ${{ runner.temp }}/llvm
+
+      - name: install NASM
+        uses: ilammy/setup-nasm@v1
+
+      - name: Checkout sources
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rust-src
+
+      - name: Add `x86_64-unknown-none` target
+        run: rustup target add x86_64-unknown-none
+      
+      - name: Preparation Work
+        run: bash sh_script/preparation.sh
+      
+      - name: Install libtinfo5
+        run: sudo apt-get update -y && sudo apt-get install libtinfo5 -y
+        if: runner.os == 'Linux'
+
+      - name: Test Shim Crates
+        run: make test 
+
+      - name: Build Release TdShim
+        run: cargo build -p td-shim --target x86_64-unknown-none --release --features=main,tdx
+      
+      - name: Build Debug TdShim
+        run: cargo build -p td-shim --target x86_64-unknown-none --features=main,tdx --no-default-features
+
+      - name: Build td-shim-tools
+        run: |
+          cargo build -p td-shim-tools
+
+      - name: Build image without payload
+        run: |
+          cargo image --release
+      
+      - name: Meta data check
+        run: |
+          cargo run -p td-shim-tools --bin td-shim-checker  --no-default-features --features=loader -- target/release/final.bin
+
+      - name: Build debug image without payload
+        run: |
+          cargo image
+
+      - name: Build Release Elf format payload
+        run: |
+          cargo image --example-payload --release
+
+      - name: E2E custom NRX image pipeline
+        run: |
+          bash sh_script/test_custom_nrx_image_build.sh
+
+      - name: Build Debug Elf format payload
+        run: |
+          cargo image --example-payload

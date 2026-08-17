@@ -1,0 +1,57 @@
+on:
+  push:
+    paths-ignore:
+      - "**.md"
+  pull_request:
+    paths-ignore:
+      - "**.md"
+  workflow_dispatch:
+
+name: Fuzzing Test
+
+env:
+  AS: nasm
+  AR_x86_64_unknown_none: llvm-ar
+  CC_x86_64_unknown_none: clang
+  RUST_TOOLCHAIN: nightly
+  TOOLCHAIN_PROFILE: minimal
+
+jobs:
+  test:
+    name: Fuzzing Test
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rust-src, llvm-tools-preview
+      
+      - name: install NASM
+        uses: ilammy/setup-nasm@v1
+      
+      - name: Install AFL (Linux)
+        run: cargo +nightly install cargo-afl
+        if: runner.os == 'Linux'
+      
+      - name: Install Cargo-Fuzz (Linux)
+        run: cargo +nightly install cargo-fuzz
+        if: runner.os == 'Linux'
+      
+      - name: Preparation work
+        run: bash sh_script/preparation.sh
+
+      - name: Run all afl fuzzing test cases (Linux)
+        run: make afl-test
+
+      - name: Run all libfuzzer fuzzing test cases (Linux)
+        run: make libfuzzer-test

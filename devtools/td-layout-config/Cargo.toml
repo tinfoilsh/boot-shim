@@ -1,0 +1,22 @@
+[package]
+name = "td-layout-config"
+version = "0.1.0"
+description = "Generate td-shim build-time/runtime layout from a json configuration file"
+repository = "https://github.com/confidential-containers/td-shim"
+homepage = "https://github.com/confidential-containers"
+license = "BSD-2-Clause-Patent"
+edition = "2018"
+
+[[bin]]
+name = "td-layout-config"
+
+[dependencies]
+clap = { version = "4.0", features = ["derive"] }
+Inflector = "0.11.4"
+parse_int = "0.6.0"
+scroll = { version = "0.10", default-features = false, features = ["derive"]}
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tera = { version = "1.20.1", default-features = false, features = ["urlencode", "slug", "humansize", "chrono"] }
+chrono = "0.4"
+humansize = "2"

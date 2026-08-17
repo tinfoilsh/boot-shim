@@ -1,0 +1,13 @@
+[package]
+name = "test-runner-server"
+version = "0.1.0"
+description = "Server to run test cases inside a qemu virtual machine"
+repository = "https://github.com/confidential-containers/td-shim"
+homepage = "https://github.com/confidential-containers"
+license = "Apache-2.0"
+edition = "2018"
+
+[dependencies]
+clap = { version = "4.0", features = ["cargo"] }
+runner-utils = "0.0.2" # small helper functions for custom runners (e.g. timeouts)
+serde_json = "1.0.114"

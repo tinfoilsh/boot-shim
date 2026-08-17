@@ -1,0 +1,88 @@
+name: Release TD-shim
+on: create
+
+env:
+  RUST_TOOLCHAIN: 1.88.0
+  TOOLCHAIN_PROFILE: minimal
+
+jobs:
+  release:
+    if: github.event_name == 'create' && github.event.ref_type== 'tag'
+    name: Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: install NASM
+        uses: ilammy/setup-nasm@v1
+
+      - name: Install LLVM and Clang
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: "10.0"
+          directory: ${{ runner.temp }}/llvm
+
+      - name: Checkout sources
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rust-src
+
+      - name: Add `x86_64-unknown-none` target
+        run: rustup target add x86_64-unknown-none
+
+      - name: Preparation Work
+        run: make preparation
+
+      - name: Generate artifacts
+        run: |
+          bash sh_script/build_final.sh
+
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref }}
+          release_name: ${{ github.ref }}
+          draft: false
+          prerelease: true
+
+      - name: Upload final-pe.bin
+        id: upload_release_final_pe_bin
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: target/release/final-pe.bin
+          asset_name: final-pe.bin
+          asset_content_type: application/octet-stream
+
+      - name: Upload final-boot-kernel.bin
+        id: upload_release_final_boot_kernel_bin
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: target/release/final-boot-kernel.bin
+          asset_name: final-boot-kernel.bin
+          asset_content_type: application/octet-stream
+
+      - name: Upload final-elf.bin
+        id: upload_release_final_elf_bin
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: target/release/final-elf.bin
+          asset_name: final-elf.bin
+          asset_content_type: application/octet-stream

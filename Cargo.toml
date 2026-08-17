@@ -1,0 +1,38 @@
+[workspace]
+resolver = "2"
+default-members = ["td-shim", "td-payload"]
+members = [
+    "cc-measurement",
+    "devtools/td-layout-config",
+    "devtools/td-benchmark",
+    "devtools/test-runner-server",
+    "devtools/test-runner-client",
+    "td-exception",
+    "td-layout",
+    "td-logger",
+    "td-paging",
+    "td-payload",
+    "td-shim",
+    "td-shim-tools",
+    "tdx-tdcall",
+    "tests/test-td-exception",
+    "tests/test-td-paging",
+    "tests/test-td-payload",
+    "xtask",
+    "td-shim-interface",
+]
+
+# the profile used for debug build of `td-shim` and `td-payload`
+[profile.dev-opt]
+inherits = "dev"
+panic = "abort" # disable stack unwinding on panic
+opt-level = "z"
+lto = true
+
+# the profile used for `cargo build --release`
+[profile.release]
+panic = "abort"    # disable stack unwinding on panic
+lto = true         # Link-time optimization
+
+[patch.crates-io]
+ring = { path = "library/ring" }

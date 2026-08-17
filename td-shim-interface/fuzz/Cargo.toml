@@ -1,0 +1,64 @@
+
+[package]
+name = "td-shim-interface-fuzz"
+version = "0.0.0"
+authors = ["Automatically generated"]
+publish = false
+edition = "2018"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = {version = "0.4", optional = true }
+afl = {version = "*", optional = true }
+r-efi = "3.2.0"
+arbitrary = "=1.1.3"
+serde = "=1.0.198"
+
+[dependencies.td-shim-interface]
+path = ".."
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[features]
+default = ["libfuzzer-sys"]
+fuzz = ["afl"]
+
+[[bin]]
+name = "payload_parser"
+path = "fuzz_targets/payload_parser.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "cfv_parser"
+path = "fuzz_targets/cfv_parser.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "hob_parser"
+path = "fuzz_targets/hob_parser.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "afl_hob_parser"
+path = "fuzz_targets/afl_hob_parser.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "afl_payload_parser"
+path = "fuzz_targets/afl_payload_parser.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "afl_cfv_parser"
+path = "fuzz_targets/afl_cfv_parser.rs"
+test = false
+doc = false

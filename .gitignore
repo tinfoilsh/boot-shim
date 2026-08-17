@@ -1,0 +1,16 @@
+*~
+
+# Cargo Junk
+target/
+*.bin
+*.igvm
+*.obj
+# afl fuzz and cargo fuzz
+*.profraw
+corpus
+artifacts
+coverage
+# Intellj working directory
+.idea
+# vscode working directory
+.vscode

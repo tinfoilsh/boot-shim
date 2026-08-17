@@ -1,0 +1,73 @@
+[package]
+name = "td-shim"
+version = "0.1.0"
+license = "BSD-2-Clause-Patent"
+edition = "2018"
+
+# add build process
+build = "build.rs"
+
+[[bin]]
+name = "td-shim"
+required-features = ["main"]
+
+[build-dependencies]
+anyhow = "1.0.55"
+cc = "1.0"
+td-layout = { path = "../td-layout" }
+tdx-tdcall = { path = "../tdx-tdcall" }
+which = "5.0.0"
+
+[dependencies]
+lazy_static = { version = "1.4.0", features = ["spin_no_std"] }
+r-efi = "3.2.0"
+scroll = { version = "0.10", default-features = false, features = ["derive"] }
+td-layout = { path = "../td-layout" }
+td-shim-interface =  { path = "../td-shim-interface" }
+cc-measurement = { path = "../cc-measurement" }
+zerocopy = { version = "=0.8.27", features = ["derive"] }
+
+td-loader = { path = "../td-loader", optional = true }
+linked_list_allocator = { version = "0.10", optional = true }
+log = { version = "0.4.13", optional = true }
+ring = { version = "0.17.14", default-features = false, features = ["alloc"], optional = true }
+spin = { version = "0.9.2", optional = true }
+td-exception =  { path = "../td-exception", optional = true }
+td-logger =  { path = "../td-logger", optional = true }
+td-paging = { path = "../td-paging", optional = true }
+x86 = { version ="0.47.0", optional = true }
+x86_64 = { version = "0.14.9", default-features = false, features = ["instructions"], optional = true }
+
+# secure boot
+der = {version = "0.7.9", features = ["derive", "alloc"], optional = true}
+
+# TDX
+tdx-tdcall = { path = "../tdx-tdcall", optional = true }
+
+[features]
+default = ["secure-boot"]
+secure-boot = ["der", "ring"]
+tdx = ["tdx-tdcall", "td-exception/tdx", "td-logger/tdx", "x86"]
+lazy-accept = ["tdx"]
+ring-hash = ["cc-measurement/ring"]
+sha2-hash = ["cc-measurement/sha2"]
+no-tdvmcall = ["tdx-tdcall/no-tdvmcall", "td-logger/no-tdvmcall", "td-exception/no-tdvmcall"]
+no-tdaccept = ["tdx-tdcall/no-tdaccept"]
+no-metadata-checks = ["td-shim-interface/no-metadata-checks"]
+tdg_dbg = ["td-logger/tdg_dbg"]
+no-td-hob = ["td-shim-interface/no-td-hob"]
+no-acpi-ccel = ["td-shim-interface/no-acpi-ccel"]
+no-config = ["td-layout/no-config"]
+no-mailbox = ["td-layout/no-mailbox"]
+
+main = [
+    "log",
+    "td-loader",
+    "linked_list_allocator",
+    "spin",
+    "td-exception",
+    "td-logger",
+    "td-paging",
+    "x86",
+    "x86_64",
+]
