@@ -1,170 +1,73 @@
-[![Main](https://github.com/confidential-containers/td-shim/actions/workflows/main.yml/badge.svg)](https://github.com/confidential-containers/td-shim/actions/workflows/main.yml)
-[![Libray Crates](https://github.com/confidential-containers/td-shim/actions/workflows/library.yml/badge.svg)](https://github.com/confidential-containers/td-shim/actions/workflows/library.yml)
-[![Cargo Deny](https://github.com/confidential-containers/td-shim/actions/workflows/deny.yml/badge.svg)](https://github.com/confidential-containers/td-shim/actions/workflows/deny.yml)
-[![Cargo Fmt & Clippy](https://github.com/confidential-containers/td-shim/actions/workflows/format.yml/badge.svg)](https://github.com/confidential-containers/td-shim/actions/workflows/format.yml)
-[![Integration Test](https://github.com/confidential-containers/td-shim/actions/workflows/integration.yml/badge.svg)](https://github.com/confidential-containers/td-shim/actions/workflows/integration.yml)
-[![TDX Integration Test](https://github.com/confidential-containers/td-shim/actions/workflows/integration-tdx.yml/badge.svg)](https://github.com/confidential-containers/td-shim/actions/workflows/integration-tdx.yml)
-[![Fuzzing Test](https://github.com/confidential-containers/td-shim/actions/workflows/fuzz.yml/badge.svg)](https://github.com/confidential-containers/td-shim/actions/workflows/fuzz.yml)
-[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2Fconfidential-containers%2Ftd-shim.svg?type=shield)](https://app.fossa.com/projects/git%2Bgithub.com%2Fconfidential-containers%2Ftd-shim?ref=badge_shield)
-# TD-shim - Confidential Containers Shim Firmware
+# Minimal TDX Linux shim
 
-Hardware virtualization-based containers are designed to launch and run
-containerized applications in hardware virtualized environments. While
-containers usually run directly as bare-metal applications, using TD or VT as an
-isolation layer from the host OS is used as a secure and efficient way of
-building multi-tenant Cloud-native infrastructures (e.g. Kubernetes).
+This repository builds a deterministic IGVM image that enters an unmodified
+upstream x86-64 Linux TDX kernel through the standard Linux boot protocol. It
+contains one reset/AP assembly component and one host-side Rust packager; there
+are no firmware services or private kernel interfaces.
 
-In order to match the short start-up time and resource consumption overhead of
-bare-metal containers, runtime architectures for TD- and VT-based containers put
-a strong focus on minimizing boot time. They must also launch the container
-payload as quickly as possible. Hardware virtualization-based containers
-typically run on top of simplified and customized Linux kernels to minimize the
-overall guest boot time.
+## Build an image
 
-Simplified kernels typically have no UEFI dependencies and no ACPI ASL
-support. This allows guests to boot without firmware dependencies. Current
-VT-based container runtimes rely on VMMs that are capable of directly booting
-into the guest kernel without loading firmware.
+The host needs Rust plus GNU `as` and `objcopy`:
 
-TD Shim is a simplified [TDX virtual firmware](doc/tdshim_spec.md#vfw) for the
-simplified kernel for TD container. This document describes a lightweight
-interface between the TD Shim and TD VMM and between the TD Shim and the
-simplified kernel.
-
-![Overview](doc/td-shim-diagram.png)
-
-## Documents
-
-* [TD-Shim specification](doc/tdshim_spec.md)
-
-* Introduction [PDF](doc/td-shim-introduction.pdf) and [conference talk](https://fosdem.org/2023/schedule/event/cc_online_rust/)
-
-## Feature Introduction
-
-This is a Shim Firmware to support [Intel TDX](https://software.intel.com/content/www/us/en/develop/articles/intel-trust-domain-extensions.html).
-
-The API specification is at [td-shim specification](doc/tdshim_spec.md).
-
-The secure boot specification for td-shim is at [secure boot specification](doc/secure_boot.md)
-
-The design is at [td-shim design](doc/design.md).
-
-The threat model analysis is at [td-shim threat model](doc/threat_model.md).
-
-## How to build
-
-### Tools
-
-1. Install [RUST](https://www.rust-lang.org/)
-
-please use 1.88.0.
-
-```
-curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain 1.88.0
-rustup target add x86_64-unknown-none
+```sh
+cargo run --release -- build \
+  --kernel /path/to/bzImage \
+  --initramfs /path/to/initramfs \
+  --output image.igvm
 ```
 
-2. Install [NASM](https://www.nasm.us/)
+This writes `image.igvm` and `image.igvm.manifest.json`. The manifest records
+the fixed layout, SHA-256 of each boot component, topology, measured shim size,
+and expected MRTD. Builds with identical inputs are byte-identical.
 
-Please make sure nasm can be found in PATH.
+The security-sensitive layout and command line are constants in
+[`src/layout.rs`](src/layout.rs). The image always describes exactly 1 GiB and
+four APIC IDs (0 through 3). The protected kernel payload is loaded at
+`0x01000000`, the initramfs at `0x20000000`, and CPUs use the ACPI MADT
+Multiprocessor Wakeup mailbox at `0x000f0000`.
 
-3. Install LLVM
+## Linux contract
 
-Please make sure clang can be found in PATH.
+Use a recent unpatched upstream kernel with these facilities enabled:
 
-Set env:
+- `CONFIG_INTEL_TDX_GUEST`
+- `CONFIG_SMP`
+- `CONFIG_ACPI` and local APIC support
+- `CONFIG_BLK_DEV_INITRD`
 
-```
-export CC=clang
-export AR=llvm-ar
+Do not enable an unaccepted-memory boot dependency. Before entering Linux the
+shim accepts every advertised ordinary-RAM page, using 2-MiB accepts with
+4-KiB edges. Hotplug, suspend, kexec and AP offlining are unsupported.
 
-export CC_x86_64_unknown_none=clang
-export AR_x86_64_unknown_none=llvm-ar
-```
+The image targets the Tinfoil/NRX TDX IGVM loader. NRX must start the reset page
+in 64-bit mode with TDX private memory and the declared four-vCPU topology.
 
-### Secure boot support
+## Fixed measured layout
 
-Please follow [Secure Boot Guide](doc/secure_boot_guide.md)
+| Address | Contents |
+| ---: | --- |
+| `0x00007000` | Linux zero page and E820 map |
+| `0x00020000` | measured command line |
+| `0x000e0000` | RSDP, XSDT and MADT |
+| `0x000f0000` | ACPI Multiprocessor Wakeup mailbox |
+| `0x00100000` | identity page tables and stacks |
+| `0x00120000` | reset/acceptance component |
+| `0x00121000` | measured copy of the bzImage setup area |
+| `0x01000000` | protected bzImage payload |
+| `0x20000000` | initramfs |
+| `0xfffff000` | architectural reset alias |
 
-### Before build
-```
-git submodule update --init --recursive
-./sh_script/preparation.sh
-```
-### Use xtask to build TdShim image
+Shim-owned measured pages are limited to 256 KiB. Kernel, initramfs, command
+line and boot-data hashes are also recorded separately in the manifest.
 
-Build TdShim image to launch a payload support Linux Boot Protocol
+## Verification
 
-```
-cargo image --release
-
-```
-Build TdShim image to launch an executable payload
-
-```
-cargo image -t executable -p /path/to/payload_binary --release
-```
-
-Build TdShim image to launch the example payload
-
-```
-cargo image --example-payload --release
-```
-
-### Build TdShim manually
-
-Build TdShim to launch a payload support Linux Boot Protocol
-
-```
-cargo build -p td-shim --target x86_64-unknown-none --release --features=main,tdx
-cargo run -p td-shim-tools --bin td-shim-ld --features=linker -- target/x86_64-unknown-none/release/ResetVector.bin target/x86_64-unknown-none/release/td-shim -o target/release/final.bin
+```sh
+cargo test --offline
+cargo clippy --offline --all-targets -- -D warnings
 ```
 
-Build TdShim to launch a executable payload
-
-```
-cargo build -p td-shim --target x86_64-unknown-none --release --features=main,tdx --no-default-features
-```
-
-Build Elf format payload
-
-```
-cargo build -p td-payload --target x86_64-unknown-none --release --bin example --features=tdx,start,cet-shstk,stack-guard
-cargo run -p td-shim-tools --bin td-shim-ld -- target/x86_64-unknown-none/release/ResetVector.bin target/x86_64-unknown-none/release/td-shim -t executable -p target/x86_64-unknown-none/release/example -o target/release/final-elf.bin
-```
-
-To build the debug TdShim, please use `dev-opt` profile to build `td-shim` binary. For example:
-
-```
-cargo build -p td-shim --target x86_64-unknown-none --profile dev-opt --features=main,tdx
-cargo run -p td-shim-tools --bin td-shim-ld --features=linker -- target/x86_64-unknown-none/dev-opt/ResetVector.bin target/x86_64-unknown-none/dev-opt/td-shim -o target/debug/final.bin
-```
-
-## Run
-REF: https://github.com/tianocore/edk2-staging/tree/TDVF
-
-```
-./launch-rust-td.sh
-```
-
-## Reproducible Build
-Reproducible build of td-shim binary requires same system user and
-source code path (see https://github.com/confidential-containers/td-shim/issues/604).
-
-The [Dockerfile](./Dockerfile) is provided to build the docker image with
-the `td-shim` compilation environment for reproducible build. You can use
-the [docker.sh](./sh_script/docker.sh) to build and run the docker container:
-
-```
-./sh_script/docker.sh -f devtools/dev_container
-```
-
-## Code Contributions
-
-1.  install [pre-commit](https://pre-commit.com/#install)
-2.  run ```pre-commit install```
-3.  when you run ```git commit```, pre-commit will do check-code things.
-
-
-## License
-[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2Fconfidential-containers%2Ftd-shim.svg?type=large)](https://app.fossa.com/projects/git%2Bgithub.com%2Fconfidential-containers%2Ftd-shim?ref=badge_large)
+Tests cover bzImage validation, exact 1-GiB E820 coverage, ACPI checksums and
+MADT wakeup data, identity page tables, final IGVM parsing, and reproducible
+output. Hardware launch and quote verification require a TDX host running NRX;
+compare the quote's MRTD with `expected_mrtd` in the generated manifest.
