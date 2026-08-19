@@ -26,6 +26,8 @@ const FOOTER_GUID: [u8; 16] = [
 const TABLE_FOOTER: usize = 48;
 const ENTRY: usize = 4 + 2 + 16;
 const TAIL: usize = TABLE_FOOTER + 2 + ENTRY;
+// The shim's data block and this table share the reset page and must not meet.
+const _: () = assert!(SHIM_DATA + SHIM_DATA_SIZE <= PAGE - TAIL as u64);
 // `-bios` is rejected unless the file is a whole number of 64-KiB blocks.
 const BLOCK: u64 = 0x1_0000;
 

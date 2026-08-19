@@ -1,14 +1,6 @@
 .include "layout.inc"
 .section .reset,"ax"
 
-# Validate [lo, hi) as private memory.  Both bounds are layout symbols, or a
-# marker the packager patches with a size-dependent address.
-.macro validate lo, hi
-    movabs $\lo, %r12
-    movabs $\hi, %r13
-    call validate_range
-.endm
-
 .code32
 .global snp_reset_start
 snp_reset_start:
@@ -48,32 +40,30 @@ snp_long_mode:
     mov %eax, %fs
     mov %eax, %gs
 
-    # Linux discovers unaccepted memory only through EFI, which this boot
-    # path does not provide, so every page the E820 map calls RAM has to be
-    # validated here.  The launch-updated pages are already validated and are
-    # skipped: revalidating them is the hypervisor page-aliasing attack.  No
-    # CPUID, MSR, I/O, GHCB or exception dependency is permitted before Linux.
-    validate 0, ZERO_PAGE
-    validate ZERO_PAGE+PAGE, CMDLINE
-    validate CMDLINE+PAGE, VGA_HOLE
-    # The VGA aperture is real MMIO and is never PVALIDATEd.  The rest of the
-    # legacy region is RAM that Linux still reads unconditionally (probe_roms,
-    # the EBDA and DMI scans), so it has to be validated around the
-    # launch-updated ACPI, CPUID, Secrets and CC-blob pages.
-    validate VGA_HOLE_END, ACPI_BASE
-    validate ACPI_BASE+PAGE, SNP_CPUID
-    validate SNP_CC_BLOB+PAGE, PAGE_TABLES
-    validate PAGE_TABLES+PAGE_TABLE_SIZE, BSP_STACK
-    validate BSP_STACK_TOP, SHIM_BASE
-    validate KERNEL_SETUP_END, KERNEL_BASE
-    validate MARK_KERNEL_END, INITRAMFS_BASE
-    validate MARK_INITRAMFS_END, RAM_SIZE
+    # Linux discovers unaccepted memory only through EFI, which this boot path
+    # does not provide, so every page of guest RAM has to be validated here.
+    # The ranges come out of the measured data block below, where the packager
+    # wrote the exact complement of the regions it placed: the launch-updated
+    # pages are already validated and are skipped, because revalidating them
+    # is the hypervisor page-aliasing attack.  There is no second copy of that
+    # map here to fall out of step with the one the digest covers.  No CPUID,
+    # MSR, I/O, GHCB or exception dependency is permitted before Linux.
+    lea shim_data(%rip), %rbp
+    add $8, %rbp
+validate_next:
+    mov (%rbp), %r12
+    mov 8(%rbp), %r13
+    mov %r12, %rax
+    or %r13, %rax
+    jz snp_boot_kernel
+    add $16, %rbp
+    call validate_range
+    jmp validate_next
 
 snp_boot_kernel:
     mov $ZERO_PAGE, %rsi
-snp_entry:
-    movabs $MARK_ENTRY, %rax
-    call *%rax
+    lea shim_data(%rip), %rax
+    jmp *(%rax)
 
 # Report an unexpected PVALIDATE outcome through the GHCB MSR termination
 # request, the only host channel available before Linux installs a #VC
@@ -153,5 +143,10 @@ zero_2m:
 validated:
     ret
 
+    # The kernel entry point and the ranges to validate, written by the
+    # packager into the measured page.  layout.rs pins the offset and size.
+    .org SHIM_DATA
+shim_data:
+    .fill SHIM_DATA_SIZE,1,0
 
     .fill 0x1000-(.-snp_reset_start),1,0

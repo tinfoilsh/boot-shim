@@ -1,7 +1,10 @@
 use crate::{
     acpi,
-    boot::{self, put32, put64},
-    image::{component, config_field, io_error, patch_u64, zeros, Component, Required},
+    boot::{self, put32, put64, Fill, Placed, ACPI, RAM, RESERVED},
+    image::{
+        component, config_field, identity_map, io_error, mmio_holes, prepare, shim_data,
+        shim_owned, write_manifest, zeros, Component, Required,
+    },
     layout::*,
 };
 use igvm::snp_defs::{SevFeatures, SevSelector, SevVmsa};
@@ -34,6 +37,9 @@ const ID_CURVE_P384: u32 = 2;
 // signature has to be computed over the same value.
 const ID_BLOCK_VERSION: u32 = 1;
 
+const SNP_SHIM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/snp_reset.bin"));
+const _: () = assert!(SNP_SHIM.len() == SHIM_SIZE as usize);
+
 #[derive(Clone)]
 struct LaunchPage {
     gpa: u64,
@@ -55,7 +61,8 @@ struct Manifest {
     platform: &'static str,
     memory_bytes: u64,
     topology: Topology,
-    command_line: &'static str,
+    command_line: String,
+    mmio_holes: Vec<String>,
     kernel_entry: String,
     expected_snp_measurement: String,
     guest_policy: String,
@@ -70,95 +77,93 @@ pub fn build(
     kernel_path: &Path,
     initramfs_path: &Path,
     output: &Path,
+    params: &Params,
     config_hash: Option<&str>,
     id_key: Option<&Path>,
     guest_svn: u32,
 ) -> Result<(), String> {
     let host_data = config_field(config_hash, 32)?;
-    let kernel_file = fs::read(kernel_path).map_err(io_error("read kernel"))?;
-    let initramfs = fs::read(initramfs_path).map_err(io_error("read initramfs"))?;
-    let info = boot::parse_bzimage(&kernel_file)?;
-    let kernel = &kernel_file[info.setup_bytes..];
-    let kernel_end = align_up(KERNEL_BASE + kernel.len() as u64, PAGE);
-    let initramfs_end = align_up(INITRAMFS_BASE + initramfs.len() as u64, PAGE);
-    if kernel_end > INITRAMFS_BASE || KERNEL_BASE + info.init_size as u64 > INITRAMFS_BASE {
-        return Err("protected kernel overlaps the fixed initramfs address".into());
-    }
-    if initramfs_end > RAM_SIZE {
-        return Err("initramfs exceeds the fixed 1-GiB guest memory".into());
-    }
-    if info.setup_bytes > KERNEL_SETUP_AREA_SIZE as usize {
-        return Err("bzImage setup area exceeds its fixed measured reservation".into());
-    }
+    let p = prepare(kernel_path, initramfs_path, params)?;
+    let acpi = acpi::build(SNP_VCPU_COUNT, false);
 
-    let acpi = acpi::build_snp();
-    let zero = boot::zero_page_snp(&kernel_file, info, initramfs.len(), acpi.rsdp)?;
-    let mut command = COMMAND_LINE.as_bytes().to_vec();
-    command.push(0);
-    command.resize(PAGE as usize, 0);
-    let tables = encrypted_page_tables();
-    let stacks = boot::gdt_stack();
-    let cc_blob = cc_blob();
-    let mut shim = include_bytes!(concat!(env!("OUT_DIR"), "/snp_reset.bin")).to_vec();
-    patch_u64(&mut shim, MARK_KERNEL_END, kernel_end)?;
-    patch_u64(&mut shim, MARK_INITRAMFS_END, initramfs_end)?;
-    let entry = KERNEL_BASE + info.entry_offset;
-    patch_u64(&mut shim, MARK_ENTRY, entry)?;
-    if shim.len() != SHIM_SIZE as usize {
-        return Err("reset shim is not the single page the layout reserves".into());
-    }
-    let mut setup = vec![0u8; KERNEL_SETUP_AREA_SIZE as usize];
-    setup[..info.setup_bytes].copy_from_slice(&kernel_file[..info.setup_bytes]);
-    let shim_owned = zero.len()
-        + command.len()
-        + acpi.bytes.len()
-        + 2 * PAGE as usize
-        + cc_blob.len()
-        + tables.len()
-        + stacks.len()
-        + shim.len();
-    if shim_owned > SHIM_LIMIT {
+    // The one authoritative map, exactly as on TDX: the E820 map, the pages
+    // the loader imports and the ranges the shim validates all come from it.
+    let mut placed = vec![
+        // Filled in once the map it describes has been derived from it.
+        Placed::measured(ZERO_PAGE, RESERVED, vec![0u8; PAGE as usize]),
+        Placed::measured(CMDLINE, RESERVED, p.command.clone()),
+        Placed::measured(ACPI_BASE, ACPI, acpi.bytes.clone()),
+        Placed::host(SNP_CPUID),
+        Placed::host(SNP_SECRETS),
+        Placed::measured(SNP_CC_BLOB, RESERVED, cc_blob()),
+        Placed::measured(PAGE_TABLES, RESERVED, identity_map(params.cbit as u64)),
+        Placed::measured(BSP_STACK, RESERVED, boot::gdt_stack()),
+        Placed::measured(SHIM_BASE, RESERVED, vec![0u8; PAGE as usize]),
+        Placed::measured(KERNEL_SETUP_BASE, RESERVED, p.setup.clone()),
+        Placed::measured(KERNEL_BASE, RAM, p.kernel.clone()),
+        Placed::measured(INITRAMFS_BASE, RAM, p.initramfs.clone()),
+    ];
+    placed.extend(params.mmio.iter().map(|(b, n)| Placed::mmio(*b, *n)));
+    boot::validate(&placed, params.memory)?;
+    let e820 = boot::e820(&placed, params.memory);
+    let zero = boot::zero_page_snp(&p.setup, p.info, p.initramfs.len(), acpi.rsdp, &e820)?;
+    boot::fill(&mut placed, ZERO_PAGE, zero)?;
+
+    let mut shim = SNP_SHIM.to_vec();
+    shim_data(
+        &mut shim,
+        p.entry,
+        &boot::accept_ranges(&placed, params.memory),
+    )?;
+    boot::fill(&mut placed, SHIM_BASE, shim.clone())?;
+
+    let owned = shim_owned(&placed);
+    if owned > SHIM_LIMIT {
         return Err(format!(
-            "SNP shim-owned measured pages exceed 256 KiB: {shim_owned}"
+            "SNP shim-owned measured pages exceed 256 KiB: {owned}"
         ));
     }
 
+    placed.sort_by_key(|p| p.base);
     let mut pages = Vec::new();
-    add_normal(&mut pages, ZERO_PAGE, &zero);
-    add_normal(&mut pages, CMDLINE, &command);
-    add_normal(&mut pages, ACPI_BASE, &acpi.bytes);
-    add_special(
-        &mut pages,
-        SNP_CPUID,
-        IgvmPageDataType::CPUID_DATA,
-        PAGE_CPUID,
-    );
-    add_special(
-        &mut pages,
-        SNP_SECRETS,
-        IgvmPageDataType::SECRETS,
-        PAGE_SECRETS,
-    );
-    add_normal(&mut pages, SNP_CC_BLOB, &cc_blob);
-    add_normal(&mut pages, PAGE_TABLES, &tables);
-    add_normal(&mut pages, BSP_STACK, &stacks);
-    add_normal(&mut pages, SHIM_BASE, &shim);
-    add_normal(&mut pages, KERNEL_SETUP_BASE, &setup);
-    add_normal(&mut pages, KERNEL_BASE, kernel);
-    add_normal(&mut pages, INITRAMFS_BASE, &initramfs);
-    pages.sort_by_key(|p| p.gpa);
+    for region in &placed {
+        match region.fill {
+            // The CPUID and Secrets pages carry contents the loader and the
+            // firmware supply; SNP_LAUNCH_UPDATE measures both by type and
+            // address with a zeroed CONTENTS field.
+            Fill::Host if region.base == SNP_CPUID => {
+                add_special(&mut pages, region.base, IgvmPageDataType::CPUID_DATA, PAGE_CPUID)
+            }
+            Fill::Host => add_special(
+                &mut pages,
+                region.base,
+                IgvmPageDataType::SECRETS,
+                PAGE_SECRETS,
+            ),
+            Fill::Measured(_) => add_normal(&mut pages, region.base, region.data()),
+            Fill::Mmio(_) => {}
+        }
+    }
     validate_pages(&pages)?;
 
     let directive_vmsa = directive_vmsa();
-    validate_vmsa(&directive_vmsa)?;
+    validate_vmsa(&directive_vmsa, params)?;
     let vmsa = vmsa_page(&directive_vmsa);
     let measurement = launch_measurement(&pages, &vmsa);
-    let mut directives = vec![IgvmDirectiveHeader::RequiredMemory {
-        gpa: 0,
-        compatibility_mask: COMPAT,
-        number_of_bytes: RAM_SIZE as u32,
-        vtl2_protectable: false,
-    }];
+    // IGVM states a required-memory span in 32 bits, so a larger guest is
+    // described by consecutive spans rather than silently truncated to one.
+    let mut directives = Vec::new();
+    let mut at = 0u64;
+    while at < params.memory {
+        let bytes = (params.memory - at).min(0xffff_f000);
+        directives.push(IgvmDirectiveHeader::RequiredMemory {
+            gpa: at,
+            compatibility_mask: COMPAT,
+            number_of_bytes: bytes as u32,
+            vtl2_protectable: false,
+        });
+        at += bytes;
+    }
     for p in &pages {
         directives.push(IgvmDirectiveHeader::PageData {
             gpa: p.gpa,
@@ -208,37 +213,36 @@ pub fn build(
     fs::write(output, &serialized).map_err(io_error("write SNP IGVM"))?;
 
     let mut components = BTreeMap::new();
-    components.insert("kernel", component(KERNEL_BASE, &kernel_file));
-    components.insert("initramfs", component(INITRAMFS_BASE, &initramfs));
-    components.insert("command_line", component(CMDLINE, COMMAND_LINE.as_bytes()));
+    components.insert("kernel", component(KERNEL_BASE, &p.kernel));
+    components.insert("kernel_setup", component(KERNEL_SETUP_BASE, &p.setup));
+    components.insert("initramfs", component(INITRAMFS_BASE, &p.initramfs));
+    components.insert("command_line", component(CMDLINE, &p.command));
     components.insert("acpi", component(ACPI_BASE, &acpi.bytes));
-    components.insert("cc_blob", component(SNP_CC_BLOB, &cc_blob));
+    components.insert("cc_blob", component(SNP_CC_BLOB, &cc_blob()));
     components.insert("vmsa", component(SNP_VMSA, &vmsa));
     components.insert("shim", component(SHIM_BASE, &shim));
     let manifest = Manifest {
         format_version: 1,
         platform: "sev-snp",
-        memory_bytes: RAM_SIZE,
+        memory_bytes: params.memory,
         topology: Topology {
             sockets: 1,
             cores: SNP_VCPU_COUNT as u8,
             threads_per_core: 1,
             vcpus: SNP_VCPU_COUNT,
         },
-        command_line: COMMAND_LINE,
-        kernel_entry: format!("0x{entry:08x}"),
+        command_line: params.cmdline.clone(),
+        mmio_holes: mmio_holes(params),
+        kernel_entry: format!("0x{:08x}", p.entry),
         expected_snp_measurement: hex::encode(measurement),
         guest_policy: format!("0x{SNP_GUEST_POLICY:016x}"),
-        c_bit_position: SNP_CBIT,
+        c_bit_position: params.cbit,
         sev_features: format!("0x{SNP_SEV_FEATURES:016x}"),
-        shim_owned_bytes: shim_owned,
+        shim_owned_bytes: owned,
         attestation: snp_attestation(&measurement, host_data, guest_svn, signed),
         components,
     };
-    let mut json = serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?;
-    json.push(b'\n');
-    fs::write(format!("{}.manifest.json", output.display()), json)
-        .map_err(io_error("write SNP manifest"))
+    write_manifest(output, &manifest)
 }
 
 // A signed ID block turns the launch digest from something a verifier checks
@@ -335,6 +339,18 @@ fn snp_attestation(
     // The guest policy cannot forbid SMT, so the report has to: PLATFORM_INFO
     // records whether the host had SMT enabled at launch.
     r.insert("platform_info_smt_en", Some("false".into()));
+    // RAPL turns guest power draw into a side channel the guest cannot defend
+    // against, and disabling it is the host's decision, so the report is the
+    // only place it can be checked.  TSME_EN and ECC_EN are in the same field
+    // but say nothing about guest isolation, so neither is constrained.
+    r.insert("platform_info_rapl_dis", Some("true".into()));
+    // Ciphertext hiding stops the host reading guest ciphertext at all.  Not
+    // every platform offers it, so the deployer pins it to what theirs can do
+    // rather than this build demanding it.
+    r.insert("platform_info_ciphertext_hiding_en", None);
+    // A masked chip key means the report is not signed by a key rooted in this
+    // CPU's endorsement key, which makes the rest of these checks unfounded.
+    r.insert("signer_info_mask_chip_key", Some("false".into()));
     // Without an ID block the firmware never compares its digest to anything,
     // and both signer digests stay zero -- which is itself the check that says
     // "this launch was unenforced".
@@ -405,16 +421,47 @@ fn directive_vmsa() -> Box<SevVmsa> {
     v
 }
 
-fn validate_vmsa(v: &SevVmsa) -> Result<(), String> {
-    if v.cr0 != 0x31
-        || v.cr3 != 0
-        || v.rdx != 0
-        || v.rip != SHIM_BASE
-        || v.rsi != ZERO_PAGE
-        || v.vmpl != 0
-        || v.sev_features.into_bits() != SNP_SEV_FEATURES
-    {
+// Every field the launch digest depends on.  QEMU applies the GPRs, segments
+// and control registers from this file but supplies the rest from its own
+// reset state, so a VMM whose reset values differ in any of them produces a
+// different measurement -- and, with a signed ID block, a launch that fails on
+// hardware with nothing to point at.  Checking the whole pinned set here turns
+// that into a build failure the moment someone edits the table above.
+fn validate_vmsa(v: &SevVmsa, params: &Params) -> Result<(), String> {
+    let data = |s: &SevSelector, sel: u64, attrib: u16| {
+        s.selector == sel as u16 && s.attrib == attrib && s.limit == 0xffff_ffff && s.base == 0
+    };
+    let pinned = v.cr0 == 0x31
+        && v.cr3 == 0
+        && v.cr4 == 0x60
+        && v.efer == 0x1000
+        && v.rdx == 0
+        && v.rip == SHIM_BASE
+        && v.rsp == BSP_STACK_TOP
+        && v.rsi == ZERO_PAGE
+        && v.rflags == 2
+        && v.vmpl == 0
+        && v.dr6 == 0xffff_0ff0
+        && v.dr7 == 0x400
+        && v.pat == 0x0007_0406_0007_0406
+        && v.xcr0 == 1
+        && v.mxcsr == 0x1f80
+        && v.x87_fcw == 0x037f
+        && v.gdtr.base == BSP_STACK
+        && v.gdtr.limit == GDT_LIMIT as u32
+        && v.idtr.limit == 0
+        && data(&v.cs, BOOT_CS32, 0x0c9b)
+        && data(&v.ds, BOOT_DS, 0x0c93)
+        && data(&v.ss, BOOT_DS, 0x0c93)
+        && v.sev_features.into_bits() == SNP_SEV_FEATURES;
+    if !pinned {
         return Err("SNP VMSA invariant failed".into());
+    }
+    // The shim runs on the encrypted identity map built around this bit, and
+    // nothing before Linux may take a CPUID dependency to discover it, so the
+    // image states it and the manifest publishes it for the verifier.
+    if params.cbit < 32 || params.cbit > 63 {
+        return Err("SNP C-bit position is not a usable physical address bit".into());
     }
     Ok(())
 }
@@ -423,28 +470,6 @@ fn vmsa_page(vmsa: &SevVmsa) -> Vec<u8> {
     let mut page = vec![0u8; PAGE as usize];
     page[..vmsa.as_bytes().len()].copy_from_slice(vmsa.as_bytes());
     page
-}
-
-fn encrypted_page_tables() -> Vec<u8> {
-    let c = 1u64 << SNP_CBIT;
-    let mut v = vec![0u8; PAGE_TABLE_SIZE as usize];
-    put64(&mut v, 0, (PAGE_TABLES + PAGE) | c | 3);
-    for pdpt in 0..4 {
-        put64(
-            &mut v,
-            PAGE as usize + pdpt * 8,
-            (PAGE_TABLES + (2 + pdpt as u64) * PAGE) | c | 3,
-        );
-        for pde in 0..512 {
-            let index = pdpt * 512 + pde;
-            put64(
-                &mut v,
-                (2 + pdpt) * PAGE as usize + pde * 8,
-                (index as u64 * 0x20_0000) | c | 0x83,
-            );
-        }
-    }
-    v
 }
 
 // A SETUP_CC_BLOB record for boot_params.hdr.setup_data, followed in the same
@@ -527,6 +552,7 @@ fn validate_serialized(v: &[u8]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::image::tests::{params, test_kernel};
     use tempfile::tempdir;
     #[test]
     fn vmsa_is_the_pinned_reset_state() {
@@ -542,13 +568,38 @@ mod tests {
         assert_eq!(v.mxcsr, 0x1f80);
         assert_eq!(v.x87_fcw, 0x037f);
         assert_eq!(v.rsi, ZERO_PAGE);
+        assert!(validate_vmsa(&v, &params()).is_ok());
+        // Any drift in the reset state QEMU supplies rather than reads from
+        // this file changes the measurement, so none of it may go unchecked.
+        for break_it in [
+            (|v: &mut SevVmsa| v.dr6 = 0) as fn(&mut SevVmsa),
+            |v| v.dr7 = 0,
+            |v| v.pat = 0,
+            |v| v.xcr0 = 0,
+            |v| v.mxcsr = 0,
+            |v| v.x87_fcw = 0,
+            |v| v.cr4 = 0,
+            |v| v.efer = 0,
+            |v| v.rsp = 0,
+            |v| v.rflags = 0,
+            |v| v.gdtr.base = 0,
+            |v| v.idtr.limit = 1,
+            |v| v.cs.attrib = 0,
+            |v| v.ds.selector = 0,
+        ] {
+            let mut v = directive_vmsa();
+            break_it(&mut v);
+            assert!(validate_vmsa(&v, &params()).is_err());
+        }
     }
     #[test]
     fn tables_are_encrypted_identity_maps() {
-        let p = encrypted_page_tables();
-        let e = u64::from_le_bytes(p[8192..8200].try_into().unwrap());
-        assert_eq!(e & (1u64 << SNP_CBIT), 1u64 << SNP_CBIT);
-        assert_eq!(e & 0x83, 0x83);
+        let p = identity_map(DEFAULT_CBIT as u64);
+        // The 1-GiB page covering [4 GiB, 5 GiB): past the old map's end, and
+        // the first entry a guest larger than 4 GiB depends on.
+        let at = (PAGE + 4 * 8) as usize;
+        let e = u64::from_le_bytes(p[at..at + 8].try_into().unwrap());
+        assert_eq!(e, (4 * GIB) | (1u64 << DEFAULT_CBIT) | 0x83);
     }
     #[test]
     fn cc_blob_points_to_special_pages() {
@@ -679,18 +730,28 @@ mod tests {
         let initramfs_path = dir.path().join("initrd");
         let a = dir.path().join("a.igvm");
         let b = dir.path().join("b.igvm");
-        let mut kernel = vec![0u8; 8192];
-        kernel[0x1f1] = 4;
-        kernel[0x1fe..0x200].copy_from_slice(&0xaa55u16.to_le_bytes());
-        kernel[0x202..0x206].copy_from_slice(b"HdrS");
-        kernel[0x206..0x208].copy_from_slice(&0x020cu16.to_le_bytes());
-        kernel[0x211] = 1;
-        kernel[0x236] = 1;
-        kernel[0x260..0x264].copy_from_slice(&0x20_0000u32.to_le_bytes());
-        fs::write(&kernel_path, kernel).unwrap();
+        fs::write(&kernel_path, test_kernel()).unwrap();
         fs::write(&initramfs_path, b"test initramfs").unwrap();
-        build(&kernel_path, &initramfs_path, &a, None, None, 0).unwrap();
-        build(&kernel_path, &initramfs_path, &b, None, None, 0).unwrap();
+        build(&kernel_path, &initramfs_path, &a, &params(), None, None, 0).unwrap();
+        build(&kernel_path, &initramfs_path, &b, &params(), None, None, 0).unwrap();
         assert_eq!(fs::read(a).unwrap(), fs::read(b).unwrap());
+    }
+
+    /// The guest policy cannot express these, and the launch digest does not
+    /// cover them, so the report is the only place they can be required.
+    #[test]
+    fn snp_attestation_pins_what_the_policy_cannot() {
+        let r = snp_attestation(&[0u8; 48], zeros(32), 0, None);
+        assert_eq!(r["platform_info_smt_en"], Some("false".into()));
+        // RAPL turns guest power draw into a side channel.
+        assert_eq!(r["platform_info_rapl_dis"], Some("true".into()));
+        // A masked chip key leaves every other check in here unfounded.
+        assert_eq!(r["signer_info_mask_chip_key"], Some("false".into()));
+        // Not every platform can hide ciphertext, so the deployer pins it.
+        assert_eq!(r["platform_info_ciphertext_hiding_en"], None);
+        // Both signer digests zero is what says the firmware compared the
+        // launch digest against nothing at all.
+        assert_eq!(r["id_key_digest"], Some(zeros(48)));
+        assert_eq!(r["author_key_digest"], Some(zeros(48)));
     }
 }

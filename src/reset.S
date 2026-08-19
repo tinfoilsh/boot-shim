@@ -1,14 +1,6 @@
 .include "layout.inc"
 .section .reset,"ax"
 
-# Accept [lo, hi) as private memory.  Both bounds are layout symbols, or a
-# marker the packager patches with a size-dependent address.
-.macro accept lo, hi
-    movabs $\lo, %r12
-    movabs $\hi, %r13
-    call accept_range
-.endm
-
 .code32
 .global reset_start
 reset_start:
@@ -49,31 +41,29 @@ long_mode:
     jnz ap_wait
     mov $BSP_STACK_TOP, %rsp
 
-    # Accept every page the measured E820 map calls RAM.  Linux discovers
-    # unaccepted memory only through EFI, which this boot path does not
-    # provide.  The pages the loader added are already accepted and are
-    # skipped: accepting one twice is how a page gets silently replaced.
-    accept 0, ZERO_PAGE
-    accept ZERO_PAGE+PAGE, CMDLINE
-    accept CMDLINE+PAGE, VGA_HOLE
-    # The VGA aperture is MMIO on a q35 machine and never guest RAM.  The rest
-    # of the legacy region is memory Linux reads unconditionally -- the EBDA
-    # and ROM scans -- so it is accepted around the measured ACPI tables, the
-    # wakeup mailbox and the host's TD HOB.
-    accept VGA_HOLE_END, ACPI_BASE
-    accept ACPI_BASE+PAGE, MAILBOX
-    accept TD_HOB+PAGE, PAGE_TABLES
-    accept PAGE_TABLES+PAGE_TABLE_SIZE, BSP_STACK
-    accept BSP_STACK_TOP, KERNEL_SETUP_BASE
-    accept KERNEL_SETUP_END, KERNEL_BASE
-    accept MARK_KERNEL_END, INITRAMFS_BASE
-    accept MARK_INITRAMFS_END, RAM_SIZE
+    # Accept every page of guest RAM.  Linux discovers unaccepted memory only
+    # through EFI, which this boot path does not provide.  The ranges come out
+    # of the measured data block below, where the packager wrote the exact
+    # complement of the regions it placed: the pages the loader added are
+    # already accepted and are skipped, because accepting one twice is how a
+    # page gets silently replaced.  There is no second copy of that map here
+    # to fall out of step with the one the digest covers.
+    lea shim_data(%rip), %rbp
+    add $8, %rbp
+accept_next:
+    mov (%rbp), %r12
+    mov 8(%rbp), %r13
+    mov %r12, %rax
+    or %r13, %rax
+    jz boot_kernel
+    add $16, %rbp
+    call accept_range
+    jmp accept_next
 
 boot_kernel:
     mov $ZERO_PAGE, %rsi
-entry_imm:
-    movabs $MARK_ENTRY, %rax
-    jmp *%rax
+    lea shim_data(%rip), %rax
+    jmp *(%rax)
 
 # Accept [%r12, %r13) as private memory, preferring 2-MiB pages.  A frame that
 # already holds accepted pages reports TDX_PAGE_SIZE_MISMATCH and is retried
@@ -131,12 +121,27 @@ ap_poll:
     jmp *%rax
 
 # Every reachable cause of this is a disagreement between the image and its
-# loader about which pages the digest covers, and a TD has no channel to report
-# it on that the boot path is allowed to depend on.
+# loader about which pages the digest covers.  Report it through
+# TDG.VP.VMCALL<ReportFatalError> -- the architectural channel for exactly
+# this, and the only thing this shim ever says to the host -- so the failure
+# reaches the operator instead of looking like a TD that hung.  R12 carries
+# the offending address; the TD halts either way.
 die:
+    mov $0x1c00, %ecx               # expose R10, R11 and R12 to the host
+    xor %r10d, %r10d                # standard GHCI
+    mov $0x10003, %r11d             # ReportFatalError
+    xor %eax, %eax                  # TDG.VP.VMCALL
+    tdcall
+fatal:
     cli
     hlt
-    jmp die
+    jmp fatal
+
+    # The kernel entry point and the ranges to accept, written by the packager
+    # into the measured page.  layout.rs pins the offset and the size.
+    .org SHIM_DATA
+shim_data:
+    .fill SHIM_DATA_SIZE,1,0
 
     .org 0xff0
 reset_vector:

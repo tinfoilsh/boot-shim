@@ -11,6 +11,7 @@ use std::{
 mod layout {
     include!("src/layout.rs");
 }
+#[allow(unused_imports)]
 use layout::*;
 
 fn run(command: &mut Command) {
@@ -20,42 +21,9 @@ fn run(command: &mut Command) {
 
 fn write_layout(path: &Path) {
     let mut out = String::from("# Generated from src/layout.rs by build.rs.\n");
-    macro_rules! export {
-        ($($name:ident),* $(,)?) => {$(
-            out.push_str(&format!(".set {}, {:#x}\n", stringify!($name), $name));
-        )*};
+    for (name, value) in layout::SYMBOLS {
+        out.push_str(&format!(".set {name}, {value:#x}\n"));
     }
-    export!(
-        PAGE,
-        RAM_SIZE,
-        ZERO_PAGE,
-        CMDLINE,
-        VGA_HOLE,
-        VGA_HOLE_END,
-        ACPI_BASE,
-        MAILBOX,
-        TD_HOB,
-        SNP_CPUID,
-        SNP_CC_BLOB,
-        PAGE_TABLES,
-        PAGE_TABLE_SIZE,
-        BSP_STACK,
-        BSP_STACK_SIZE,
-        BSP_STACK_TOP,
-        SHIM_BASE,
-        KERNEL_SETUP_BASE,
-        KERNEL_SETUP_END,
-        KERNEL_BASE,
-        INITRAMFS_BASE,
-        RESET_ALIAS,
-        MARK_KERNEL_END,
-        MARK_INITRAMFS_END,
-        MARK_ENTRY,
-        GDT_PTR,
-        BOOT_CS32,
-        BOOT_CS,
-        BOOT_DS,
-    );
     fs::write(path, out).expect("write layout.inc");
 }
 

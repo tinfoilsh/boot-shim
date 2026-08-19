@@ -1,25 +1,20 @@
-use crate::layout::{ACPI_BASE, MAILBOX, SNP_VCPU_COUNT, VCPU_COUNT};
+use crate::layout::*;
 
 pub struct AcpiTables {
     pub bytes: Vec<u8>,
     pub rsdp: u64,
 }
 
-pub fn build() -> AcpiTables {
-    build_for(VCPU_COUNT, true)
-}
-
-pub fn build_snp() -> AcpiTables {
-    build_for(SNP_VCPU_COUNT, false)
-}
-
-fn build_for(cpus: u32, wakeup: bool) -> AcpiTables {
+/// The tables are one measured page, laid out at the offsets layout.rs pins
+/// and asserts do not overlap.  `Params::new` bounds `cpus` so the MADT it
+/// sizes here always fits the page.
+pub fn build(cpus: u32, wakeup: bool) -> AcpiTables {
     let rsdp = ACPI_BASE;
-    let xsdt = ACPI_BASE + 0x100;
-    let fadt = ACPI_BASE + 0x200;
-    let dsdt = ACPI_BASE + 0x400;
-    let madt = ACPI_BASE + 0x500;
-    let mut bytes = vec![0u8; 4096];
+    let xsdt = ACPI_BASE + ACPI_XSDT;
+    let fadt = ACPI_BASE + ACPI_FADT;
+    let dsdt = ACPI_BASE + ACPI_DSDT;
+    let madt = ACPI_BASE + ACPI_MADT;
+    let mut bytes = vec![0u8; PAGE as usize];
 
     bytes[0..8].copy_from_slice(b"RSD PTR ");
     bytes[9..15].copy_from_slice(b"TINFOI");
@@ -101,12 +96,12 @@ mod tests {
     use super::*;
     #[test]
     fn tables_have_valid_checksums_and_wakeup() {
-        let a = build();
+        let a = build(DEFAULT_VCPUS, true);
         assert_eq!(
             a.bytes[0..36].iter().fold(0u8, |x, y| x.wrapping_add(*y)),
             0
         );
-        let mo = 0x500;
+        let mo = ACPI_MADT as usize;
         let len = u32::from_le_bytes(a.bytes[mo + 4..mo + 8].try_into().unwrap()) as usize;
         assert_eq!(
             a.bytes[mo..mo + len]
@@ -114,15 +109,23 @@ mod tests {
                 .fold(0u8, |x, y| x.wrapping_add(*y)),
             0
         );
-        assert_eq!(a.bytes[mo + 44 + VCPU_COUNT as usize * 8], 16);
+        assert_eq!(a.bytes[mo + 44 + DEFAULT_VCPUS as usize * 8], 16);
     }
     #[test]
     fn snp_madt_advertises_only_the_provisioned_cpu() {
-        let a = build_snp();
-        let len = u32::from_le_bytes(a.bytes[0x504..0x508].try_into().unwrap());
+        let a = build(SNP_VCPU_COUNT, false);
+        let at = ACPI_MADT as usize + 4;
+        let len = u32::from_le_bytes(a.bytes[at..at + 4].try_into().unwrap());
         assert_eq!(len, 44 + SNP_VCPU_COUNT * 8);
         // Without a wakeup structure Linux has no way to start an AP, so any
         // extra Local APIC entry would promise a CPU that can never run.
         assert_eq!(SNP_VCPU_COUNT, 1);
+    }
+    #[test]
+    fn the_largest_allowed_madt_still_fits_its_measured_page() {
+        let a = build(MAX_VCPUS, true);
+        let at = ACPI_MADT as usize;
+        let len = u32::from_le_bytes(a.bytes[at + 4..at + 8].try_into().unwrap()) as usize;
+        assert!(at + len <= PAGE as usize);
     }
 }
