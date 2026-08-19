@@ -11,9 +11,15 @@ pub const ZERO_PAGE: u64 = 0x0000_7000;
 pub const CMDLINE: u64 = 0x0002_0000;
 // The legacy VGA aperture is real MMIO on a q35 machine and never guest RAM.
 pub const VGA_HOLE: u64 = 0x000a_0000;
+// Only the shims read this one, through layout.inc.
+#[allow(dead_code)]
 pub const VGA_HOLE_END: u64 = 0x000c_0000;
 pub const ACPI_BASE: u64 = 0x000e_0000;
 pub const MAILBOX: u64 = 0x000f_0000;
+// The one page the host fills in: QEMU writes its own memory map there as a
+// TD HOB.  Nothing here reads it -- the E820 map Linux uses is measured -- but
+// a loader refuses an image that does not say where it goes.
+pub const TD_HOB: u64 = 0x000f_1000;
 pub const SNP_CPUID: u64 = 0x000f_0000;
 pub const SNP_SECRETS: u64 = 0x000f_1000;
 pub const SNP_CC_BLOB: u64 = 0x000f_2000;
@@ -37,6 +43,7 @@ pub const SHIM_LIMIT: usize = 256 * 1024;
 // A shim validates the gaps between these, so a layout change that closed or
 // reordered one would silently make it validate a launch-updated page.
 const _: () = assert!(VGA_HOLE < VGA_HOLE_END && VGA_HOLE_END <= ACPI_BASE);
+const _: () = assert!(MAILBOX + PAGE == TD_HOB && TD_HOB + PAGE <= PAGE_TABLES);
 const _: () = assert!(SNP_CC_BLOB + PAGE <= PAGE_TABLES);
 const _: () = assert!(PAGE_TABLES + PAGE_TABLE_SIZE <= BSP_STACK);
 const _: () = assert!(BSP_STACK_TOP <= SHIM_BASE);

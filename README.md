@@ -1,9 +1,16 @@
 # Minimal TDX and AMD SEV-SNP Linux shim
 
-This repository builds a deterministic IGVM image that enters an unmodified
+This repository builds a deterministic boot image that enters an unmodified
 upstream x86-64 Linux TDX kernel through the standard Linux boot protocol. It
 contains one reset/AP assembly component and one host-side Rust packager; there
 are no firmware services or private kernel interfaces.
+
+Everything the guest starts on is a measured page. On TDX the image is a TDVF
+metadata firmware, which is how a loader is told which pages to hand the TDX
+module: every one of them is added with `TDH.MEM.PAGE.ADD` and, apart from the
+host's own TD HOB page, extended into MRTD with `TDH.MR.EXTEND`. Nothing is
+measured afterwards -- no RTMR is extended and no event log is produced -- so
+the whole chain of trust is the launch digest.
 
 ## Build an image
 
@@ -13,12 +20,26 @@ The host needs Rust plus GNU `as` and `objcopy`:
 cargo run --release -- build \
   --kernel /path/to/bzImage \
   --initramfs /path/to/initramfs \
-  --output image.igvm
+  --output image.fw
 ```
 
-This writes `image.igvm` and `image.igvm.manifest.json`. The manifest records
-the fixed layout, SHA-256 of each boot component, topology, measured shim size,
-and expected MRTD. Builds with identical inputs are byte-identical.
+This writes `image.fw` and `image.fw.manifest.json`. The manifest records the
+fixed layout, SHA-256 of each boot component, topology, measured shim size, and
+expected MRTD. Builds with identical inputs are byte-identical.
+
+The image is the firmware, and the whole guest is inside it:
+
+```sh
+qemu-system-x86_64 -accel kvm -m 1G -smp 4 -cpu host \
+  -machine q35,kernel_irqchip=split,confidential-guest-support=tdx \
+  -object tdx-guest,id=tdx -bios image.fw \
+  -nographic -nodefaults -serial stdio -no-reboot
+```
+
+`-m` must be the 1 GiB the measured E820 map describes, and `-smp` the four
+vCPUs the measured MADT advertises. Nothing else on the command line reaches
+the guest: there is no `-kernel`, `-initrd` or `-append`, because a host that
+could supply those could supply unmeasured ones.
 
 To build the AMD SEV-SNP variant:
 
@@ -109,8 +130,12 @@ VGA aperture. Revalidating an already-validated page is the hypervisor
 page-aliasing attack, so those gaps are exactly the ones the packager measures.
 Hotplug, suspend, kexec and AP offlining are unsupported.
 
-The image targets the Tinfoil/NRX TDX IGVM loader. NRX must start the reset page
-in 64-bit mode with TDX private memory and the declared four-vCPU topology.
+The loader contract is the architectural one: `TDH.VP.INIT` starts every vCPU
+at `0xfffffff0` in 32-bit protected mode with paging off and its vCPU index in
+`ESI`, and the shim does the rest itself. It loads the measured GDT before it
+relies on any descriptor, enables PAE paging on the measured page tables, and
+enters Linux in long mode. APs never leave the shim until the operating system
+claims them through the measured ACPI wakeup mailbox.
 
 ## Fixed measured layout
 
@@ -120,15 +145,15 @@ in 64-bit mode with TDX private memory and the declared four-vCPU topology.
 | `0x00020000` | measured command line |
 | `0x000e0000` | RSDP, XSDT and MADT |
 | `0x000f0000` | ACPI Multiprocessor Wakeup mailbox (TDX) / CPUID page (SNP) |
+| `0x000f1000` | TD HOB, written by the host and measured only by address (TDX) |
 | `0x000f1000` | Secrets page (SNP) |
 | `0x000f2000` | CC blob and `SETUP_CC_BLOB` record (SNP) |
 | `0x00100000` | identity page tables |
 | `0x00107000` | measured GDT, its pseudo-descriptor, and the BSP stack |
-| `0x00120000` | reset/acceptance component |
 | `0x00121000` | measured copy of the bzImage setup area |
 | `0x01000000` | protected bzImage payload |
 | `0x20000000` | initramfs |
-| `0xfffff000` | architectural reset alias |
+| `0xfffff000` | reset/acceptance component, at the address a TD starts from |
 
 The pages this file authors -- everything above except the kernel's own setup
 area, payload and initramfs -- are limited to 256 KiB and reported as
@@ -176,12 +201,14 @@ and the deployer has to pin.
   storage or host-supplied configuration has to bind it through `--config-hash`
   or a dm-verity root hash in the measured command line; it will not otherwise
   appear in any measurement.
-- **Loader-supplied vCPU state (TDX).** MRTD covers no vCPU state at all. The
-  reset shim therefore loads the measured GDT and the segment registers the
-  64-bit boot protocol requires before entering Linux, rather than inheriting
-  whatever the loader left. Everything above that -- the mode the loader starts
-  the reset page in, and the control registers the TDX module fixes -- remains a
-  loader contract, unlike SNP where the whole VMSA is measured.
+- **vCPU state (TDX).** MRTD covers no vCPU state at all, unlike SNP where the
+  whole VMSA is measured. What saves the TDX case is that the state is not the
+  loader's to choose: the TDX module fixes it at `TDH.VP.INIT`. The shim treats
+  everything it was handed as untrusted anyway -- it installs the measured GDT,
+  its own page tables and its own segment registers before entering Linux.
+- **The TD HOB.** The one page the host writes. `TDH.MEM.PAGE.ADD` puts its
+  address in MRTD but nothing puts its contents there, so this image does not
+  read it: the E820 map Linux boots on is a measured page instead.
 - **The manifest itself.** It is a verification policy, not a trust anchor. It
   is unsigned and no measurement covers it; pin its contents through the build
   pipeline that produced the image.
@@ -194,13 +221,16 @@ cargo clippy --offline --all-targets -- -D warnings
 ```
 
 Tests cover bzImage validation, exact 1-GiB E820 coverage, ACPI checksums and
-MADT wakeup data, identity page tables, the measured GDT, final IGVM parsing,
+MADT wakeup data, identity page tables, the measured GDT, reading the emitted
+firmware back the way QEMU does, final IGVM parsing,
 reproducible output, a known-answer check of the SNP launch digest against
 `sev-snp-measure`'s reference implementation, and verification of the ID block
 signature over the bytes the firmware checks. Hardware launch and quote
-verification require a TDX host running NRX; compare the quote's MRTD with
-`expected_mrtd` in the generated manifest and every field of `attestation`
-with the rest of the report.
+verification require a TDX host; compare the report's MRTD with `expected_mrtd`
+in the generated manifest and every field of `attestation` with the rest of the
+report. On hardware that check is exact: a TDREPORT taken inside the booted
+guest returns the manifest's `expected_mrtd` byte for byte, with all four RTMRs
+still zero.
 
 On SEV-SNP the launch itself is the check: a signed ID block makes the firmware
 compare its own digest against `expected_snp_measurement`, so a successful

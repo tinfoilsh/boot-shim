@@ -81,14 +81,6 @@ pub fn zero_page_snp(
     rsdp: u64,
 ) -> Result<Vec<u8>, String> {
     let mut page = zero_page(kernel, info, initramfs_len, rsdp)?;
-    let entries = e820_snp();
-    page[0x1e8] = entries.len() as u8;
-    for (index, entry) in entries.iter().enumerate() {
-        let at = E820_TABLE + index * 20;
-        put64(&mut page, at, entry.0);
-        put64(&mut page, at + 8, entry.1);
-        put32(&mut page, at + 16, entry.2);
-    }
     // boot_params.hdr.setup_data -> measured SETUP_CC_BLOB record.
     put64(&mut page, 0x250, SNP_CC_BLOB);
     Ok(page)
@@ -115,7 +107,10 @@ const RAM: u32 = 1;
 const RESERVED: u32 = 2;
 const ACPI: u32 = 3;
 
-fn e820_snp() -> Vec<(u64, u64, u32)> {
+// One map for both platforms: the launch-updated pages sit in the same
+// reserved holes, and the legacy VGA aperture is MMIO on a q35 machine on
+// both, so neither shim may ever accept or validate it.
+pub fn e820() -> Vec<(u64, u64, u32)> {
     vec![
         (0, ZERO_PAGE, RESERVED),
         (ZERO_PAGE, PAGE, RESERVED),
@@ -126,20 +121,6 @@ fn e820_snp() -> Vec<(u64, u64, u32)> {
         // Type 3, not RESERVED: under SEV ioremap() maps an e820 RESERVED
         // range decrypted, so ACPICA's late remap of the tables would read
         // ciphertext.  Only IORES_DESC_ACPI_TABLES keeps the C-bit set.
-        (ACPI_BASE, PAGE, ACPI),
-        (ACPI_BASE + PAGE, PAGE_TABLES - ACPI_BASE - PAGE, RESERVED),
-        (PAGE_TABLES, KERNEL_SETUP_END - PAGE_TABLES, RESERVED),
-        (KERNEL_SETUP_END, RAM_SIZE - KERNEL_SETUP_END, RAM),
-    ]
-}
-
-pub fn e820() -> Vec<(u64, u64, u32)> {
-    vec![
-        (0, ZERO_PAGE, RESERVED),
-        (ZERO_PAGE, PAGE, RESERVED),
-        (ZERO_PAGE + PAGE, CMDLINE - ZERO_PAGE - PAGE, RAM),
-        (CMDLINE, PAGE, RESERVED),
-        (CMDLINE + PAGE, ACPI_BASE - CMDLINE - PAGE, RAM),
         (ACPI_BASE, PAGE, ACPI),
         (ACPI_BASE + PAGE, PAGE_TABLES - ACPI_BASE - PAGE, RESERVED),
         (PAGE_TABLES, KERNEL_SETUP_END - PAGE_TABLES, RESERVED),
@@ -164,8 +145,14 @@ pub fn put64(v: &mut [u8], at: usize, n: u64) {
 mod tests {
     use super::*;
     #[test]
-    fn e820_is_exactly_one_gib() {
+    fn e820_covers_one_gib_without_unaccepted_memory() {
         let map = e820();
+        assert!(map
+            .iter()
+            .all(|e| e.2 == RAM || e.2 == RESERVED || e.2 == ACPI));
+        assert!(map.iter().any(|e| e.0 == ACPI_BASE && e.2 == ACPI));
+        // The q35 legacy hole holds launch-updated pages and MMIO, never RAM.
+        assert!(map.iter().any(|e| e.0 == VGA_HOLE && e.2 == RESERVED));
         assert_eq!(map.first().unwrap().0, 0);
         assert_eq!(map.last().unwrap().0 + map.last().unwrap().1, RAM_SIZE);
         for pair in map.windows(2) {
@@ -194,19 +181,4 @@ mod tests {
         assert!(parse_bzimage(&[0; 0x300]).is_err());
     }
 
-    #[test]
-    fn snp_e820_covers_one_gib_without_unaccepted_memory() {
-        let map = e820_snp();
-        assert!(map
-            .iter()
-            .all(|e| e.2 == RAM || e.2 == RESERVED || e.2 == ACPI));
-        assert!(map.iter().any(|e| e.0 == ACPI_BASE && e.2 == ACPI));
-        // The q35 legacy hole holds launch-updated pages and MMIO, never RAM.
-        assert!(map.iter().any(|e| e.0 == VGA_HOLE && e.2 == RESERVED));
-        assert_eq!(map.first().unwrap().0, 0);
-        assert_eq!(map.last().unwrap().0 + map.last().unwrap().1, RAM_SIZE);
-        for pair in map.windows(2) {
-            assert_eq!(pair[0].0 + pair[0].1, pair[1].0);
-        }
-    }
 }

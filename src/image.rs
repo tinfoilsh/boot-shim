@@ -1,10 +1,4 @@
-use crate::{acpi, boot, boot::put64, layout::*, mrtd};
-use igvm::{
-    IgvmDirectiveHeader, IgvmFile, IgvmInitializationHeader, IgvmPlatformHeader, IgvmRevision,
-};
-use igvm_defs::{
-    IgvmPageDataFlags, IgvmPageDataType, IgvmPlatformType, IGVM_VHS_SUPPORTED_PLATFORM,
-};
+use crate::{acpi, boot, boot::put64, layout::*, mrtd, tdvf};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, fs, io, path::Path};
@@ -83,9 +77,6 @@ pub fn build(
     let mut command = COMMAND_LINE.as_bytes().to_vec();
     command.push(0);
     command.resize(PAGE as usize, 0);
-    let page_tables = page_tables();
-    let mailbox = vec![0u8; PAGE as usize];
-    let stacks = boot::gdt_stack();
     let mut shim = include_bytes!(concat!(env!("OUT_DIR"), "/reset.bin")).to_vec();
     patch_u64(&mut shim, MARK_KERNEL_END, kernel_end)?;
     patch_u64(&mut shim, MARK_INITRAMFS_END, initramfs_end)?;
@@ -100,84 +91,50 @@ pub fn build(
     let mut kernel_setup = vec![0u8; KERNEL_SETUP_AREA_SIZE as usize];
     kernel_setup[..info.setup_bytes].copy_from_slice(&kernel_file[..info.setup_bytes]);
 
-    let shim_owned = zero.len()
-        + command.len()
-        + acpi.bytes.len()
-        + mailbox.len()
-        + page_tables.len()
-        + stacks.len()
-        + shim.len();
+    // Ascending GPA order, which is the order QEMU adds the sections in and
+    // therefore the order the TDX module builds MRTD in.  The reset page is
+    // appended by the packer: it has to end at 4 GiB, where a TD starts.
+    let sections = vec![
+        tdvf::section(ZERO_PAGE, &zero),
+        tdvf::section(CMDLINE, &command),
+        tdvf::section(ACPI_BASE, &acpi.bytes),
+        tdvf::section(MAILBOX, &vec![0u8; PAGE as usize]),
+        tdvf::td_hob(TD_HOB),
+        tdvf::section(PAGE_TABLES, &page_tables()),
+        tdvf::section(BSP_STACK, &boot::gdt_stack()),
+        tdvf::section(KERNEL_SETUP_BASE, &kernel_setup),
+        tdvf::section(KERNEL_BASE, kernel),
+        tdvf::section(INITRAMFS_BASE, &initramfs),
+    ];
+    let (file, sections) = tdvf::pack(sections, &shim)?;
+    validate_non_overlapping(&sections)?;
+    // Read the published file back the way QEMU will, before publishing a
+    // digest that claims to describe what it loads.
+    let described: Vec<_> = sections.iter().map(|s| (s.gpa, s.measured)).collect();
+    if tdvf::parse(&file)? != described {
+        return Err("emitted firmware does not describe the measured sections".into());
+    }
+    // Everything this file authors, as opposed to the kernel's own setup
+    // area, payload and initramfs.
+    let shim_owned: usize = sections
+        .iter()
+        .filter(|s| s.gpa < KERNEL_SETUP_BASE || s.gpa == RESET_ALIAS)
+        .map(|s| s.data.len().max(PAGE as usize))
+        .sum();
     if shim_owned > SHIM_LIMIT {
         return Err(format!(
             "shim-owned measured pages exceed 256 KiB: {shim_owned}"
         ));
     }
+    let expected_mrtd = mrtd::calculate(&pages(&sections));
+    fs::write(output, &file).map_err(io_error("write firmware"))?;
 
-    let mut pages: Vec<(u64, Vec<u8>, bool)> = Vec::new();
-    add_pages(&mut pages, ZERO_PAGE, &zero, true);
-    add_pages(&mut pages, CMDLINE, &command, true);
-    add_pages(&mut pages, ACPI_BASE, &acpi.bytes, true);
-    add_pages(&mut pages, MAILBOX, &mailbox, true);
-    add_pages(&mut pages, PAGE_TABLES, &page_tables, true);
-    add_pages(&mut pages, BSP_STACK, &stacks, true);
-    add_pages(&mut pages, SHIM_BASE, &shim, true);
-    add_pages(&mut pages, KERNEL_SETUP_BASE, &kernel_setup, true);
-    add_pages(&mut pages, KERNEL_BASE, kernel, true);
-    add_pages(&mut pages, INITRAMFS_BASE, &initramfs, true);
-    // Reset alias is what the NRX loader exposes at the architectural reset GPA.
-    add_pages(&mut pages, RESET_ALIAS, &shim, true);
-    pages.sort_by_key(|p| p.0);
-    validate_non_overlapping(&pages)?;
-
-    let expected_mrtd = mrtd::calculate(&pages);
-    let mut directives = Vec::new();
-    for (gpa, data, measured) in &pages {
-        let mut flags = IgvmPageDataFlags::new();
-        flags.set_unmeasured(!measured);
-        directives.push(IgvmDirectiveHeader::PageData {
-            gpa: *gpa,
-            compatibility_mask: 1,
-            flags,
-            data_type: IgvmPageDataType::NORMAL,
-            data: data.clone(),
-        });
-    }
-    directives.push(IgvmDirectiveHeader::RequiredMemory {
-        gpa: 0,
-        compatibility_mask: 1,
-        number_of_bytes: RAM_SIZE as u32,
-        vtl2_protectable: false,
-    });
-    let platform = IgvmPlatformHeader::SupportedPlatform(IGVM_VHS_SUPPORTED_PLATFORM {
-        compatibility_mask: 1,
-        highest_vtl: 0,
-        platform_type: IgvmPlatformType::TDX,
-        platform_version: 1,
-        shared_gpa_boundary: 1u64 << 47,
-    });
-    let file = IgvmFile::new(
-        IgvmRevision::V1,
-        vec![platform],
-        vec![IgvmInitializationHeader::GuestPolicy {
-            policy: 0,
-            compatibility_mask: 1,
-        }],
-        directives,
-    )
-    .map_err(|e| format!("construct IGVM: {e}"))?;
-    let mut serialized = Vec::new();
-    file.serialize(&mut serialized)
-        .map_err(|e| format!("serialize IGVM: {e}"))?;
-    fs::write(output, &serialized).map_err(io_error("write IGVM"))?;
-
-    // Parse our public output before committing its manifest.
-    IgvmFile::new_from_binary(&serialized, None).map_err(|e| format!("verify final IGVM: {e}"))?;
     let mut components = BTreeMap::new();
     components.insert("kernel", component(KERNEL_BASE, &kernel_file));
     components.insert("initramfs", component(INITRAMFS_BASE, &initramfs));
     components.insert("command_line", component(CMDLINE, COMMAND_LINE.as_bytes()));
     components.insert("acpi", component(ACPI_BASE, &acpi.bytes));
-    components.insert("shim", component(SHIM_BASE, &shim));
+    components.insert("shim", component(RESET_ALIAS, &shim));
     let manifest = Manifest {
         format_version: 1,
         memory_bytes: RAM_SIZE,
@@ -194,6 +151,26 @@ pub fn build(
     json.push(b'\n');
     fs::write(manifest_path, json).map_err(io_error("write manifest"))?;
     Ok(())
+}
+
+// The pages the TDX module sees, in the order it sees them: one
+// TDH.MEM.PAGE.ADD per page in section order, and 16 TDH.MR.EXTEND per page
+// for the sections the metadata marks measured.
+fn pages(sections: &[tdvf::Section]) -> Vec<(u64, Vec<u8>, bool)> {
+    let mut out = Vec::new();
+    for s in sections {
+        let count = s.data.len().max(PAGE as usize) / PAGE as usize;
+        for i in 0..count {
+            let at = i * PAGE as usize;
+            let mut page = vec![0u8; PAGE as usize];
+            let end = (at + PAGE as usize).min(s.data.len());
+            if at < end {
+                page[..end - at].copy_from_slice(&s.data[at..end]);
+            }
+            out.push((s.gpa + i as u64 * PAGE, page, s.measured));
+        }
+    }
+    out
 }
 
 // MRTD covers only the pages this file provides.  ATTRIBUTES, XFAM, the vCPU
@@ -247,17 +224,11 @@ fn page_tables() -> Vec<u8> {
     }
     v
 }
-fn add_pages(out: &mut Vec<(u64, Vec<u8>, bool)>, base: u64, data: &[u8], measured: bool) {
-    for (i, chunk) in data.chunks(PAGE as usize).enumerate() {
-        let mut page = vec![0; PAGE as usize];
-        page[..chunk.len()].copy_from_slice(chunk);
-        out.push((base + i as u64 * PAGE, page, measured));
-    }
-}
-fn validate_non_overlapping(pages: &[(u64, Vec<u8>, bool)]) -> Result<(), String> {
-    for pair in pages.windows(2) {
-        if pair[0].0 + PAGE > pair[1].0 {
-            return Err(format!("measured regions overlap at {:#x}", pair[1].0));
+fn validate_non_overlapping(sections: &[tdvf::Section]) -> Result<(), String> {
+    for pair in sections.windows(2) {
+        let end = pair[0].gpa + align_up(pair[0].data.len().max(PAGE as usize) as u64, PAGE);
+        if end > pair[1].gpa {
+            return Err(format!("measured regions overlap at {:#x}", pair[1].gpa));
         }
     }
     Ok(())
@@ -295,7 +266,7 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
     #[test]
-    fn page_tables_identity_map_one_gib() {
+    fn page_tables_identity_map_four_gib() {
         let p = page_tables();
         assert_eq!(
             u64::from_le_bytes(p[2 * 4096..2 * 4096 + 8].try_into().unwrap()),
@@ -316,13 +287,7 @@ mod tests {
         assert!(config_field(Some("abcd"), 32).is_err());
         assert!(config_field(Some(&"zz".repeat(32)), 32).is_err());
     }
-    #[test]
-    fn builds_byte_identical_parseable_images() {
-        let dir = tempdir().unwrap();
-        let kernel_path = dir.path().join("bzImage");
-        let initramfs_path = dir.path().join("initrd");
-        let a = dir.path().join("a.igvm");
-        let b = dir.path().join("b.igvm");
+    fn test_kernel() -> Vec<u8> {
         let mut kernel = vec![0u8; 8192];
         kernel[0x1f1] = 4;
         kernel[0x1fe..0x200].copy_from_slice(&0xaa55u16.to_le_bytes());
@@ -331,13 +296,29 @@ mod tests {
         kernel[0x211] = 1;
         kernel[0x236] = 1;
         kernel[0x260..0x264].copy_from_slice(&0x20_0000u32.to_le_bytes());
-        fs::write(&kernel_path, kernel).unwrap();
+        kernel
+    }
+    #[test]
+    fn builds_byte_identical_loadable_firmware() {
+        let dir = tempdir().unwrap();
+        let kernel_path = dir.path().join("bzImage");
+        let initramfs_path = dir.path().join("initrd");
+        let a = dir.path().join("a.fw");
+        let b = dir.path().join("b.fw");
+        fs::write(&kernel_path, test_kernel()).unwrap();
         fs::write(&initramfs_path, b"test initramfs").unwrap();
         build(&kernel_path, &initramfs_path, &a, None).unwrap();
         build(&kernel_path, &initramfs_path, &b, None).unwrap();
         let one = fs::read(a).unwrap();
-        let two = fs::read(b).unwrap();
-        assert_eq!(one, two);
-        IgvmFile::new_from_binary(&one, None).unwrap();
+        assert_eq!(one, fs::read(b).unwrap());
+        // QEMU rejects a firmware image that is not a whole number of 64-KiB
+        // blocks, and finds everything else from the end of the file.
+        assert_eq!(one.len() as u64 % 0x1_0000, 0);
+        let sections = tdvf::parse(&one).unwrap();
+        assert_eq!(sections.last().unwrap().0, RESET_ALIAS);
+        assert!(sections.iter().any(|s| s.0 == TD_HOB && !s.1));
+        assert!(sections.iter().all(|s| s.0 == TD_HOB || s.1));
+        // The architectural reset instruction is the last 16 bytes.
+        assert_eq!(one[one.len() - 16], 0xe9);
     }
 }

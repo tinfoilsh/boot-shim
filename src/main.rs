@@ -4,6 +4,7 @@ mod image;
 mod layout;
 mod mrtd;
 mod snp;
+mod tdvf;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
