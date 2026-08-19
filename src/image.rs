@@ -1,4 +1,4 @@
-use crate::{acpi, boot, layout::*, mrtd};
+use crate::{acpi, boot, boot::put64, layout::*, mrtd};
 use igvm::{
     IgvmDirectiveHeader, IgvmFile, IgvmInitializationHeader, IgvmPlatformHeader, IgvmRevision,
 };
@@ -10,11 +10,38 @@ use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, fs, io, path::Path};
 
 #[derive(Serialize)]
-struct Component {
+pub struct Component {
     address: String,
     size: usize,
     sha256: String,
 }
+// Values a verifier must require from the attestation report *in addition* to
+// the measurement.  Neither MRTD nor the SNP launch digest covers the TD/VM
+// configuration the host chooses at launch, so an image that publishes only a
+// digest is verifiable against a host that also turned on debug.  `None` marks
+// a field this build cannot predict and the deployer therefore has to pin.
+pub type Required = BTreeMap<&'static str, Option<String>>;
+
+pub fn zeros(bytes: usize) -> String {
+    "00".repeat(bytes)
+}
+
+// MRCONFIGID (TDX) and HOST_DATA (SNP) are the only launch inputs a deployer
+// can bind per deployment; neither enters the digest, so the manifest records
+// the value the verifier has to demand.
+pub fn config_field(hash: Option<&str>, bytes: usize) -> Result<String, String> {
+    match hash {
+        None => Ok(zeros(bytes)),
+        Some(h) => {
+            let h = h.trim().trim_start_matches("0x").to_ascii_lowercase();
+            if h.len() != bytes * 2 || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(format!("--config-hash must be {bytes} hex-encoded bytes"));
+            }
+            Ok(h)
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct Manifest {
     format_version: u32,
@@ -24,10 +51,17 @@ struct Manifest {
     kernel_entry: String,
     expected_mrtd: String,
     shim_owned_bytes: usize,
+    attestation: Required,
     components: BTreeMap<&'static str, Component>,
 }
 
-pub fn build(kernel_path: &Path, initramfs_path: &Path, output: &Path) -> Result<(), String> {
+pub fn build(
+    kernel_path: &Path,
+    initramfs_path: &Path,
+    output: &Path,
+    config_hash: Option<&str>,
+) -> Result<(), String> {
+    let mrconfigid = config_field(config_hash, 48)?;
     let kernel_file = fs::read(kernel_path).map_err(io_error("read kernel"))?;
     let initramfs = fs::read(initramfs_path).map_err(io_error("read initramfs"))?;
     let info = boot::parse_bzimage(&kernel_file)?;
@@ -51,16 +85,19 @@ pub fn build(kernel_path: &Path, initramfs_path: &Path, output: &Path) -> Result
     command.resize(PAGE as usize, 0);
     let page_tables = page_tables();
     let mailbox = vec![0u8; PAGE as usize];
-    let stacks = vec![0u8; 0x10_000_usize];
+    let stacks = boot::gdt_stack();
     let mut shim = include_bytes!(concat!(env!("OUT_DIR"), "/reset.bin")).to_vec();
-    patch_u64(&mut shim, 0x1111111111111111, kernel_end)?;
-    patch_u64(&mut shim, 0x2222222222222222, initramfs_end)?;
+    patch_u64(&mut shim, MARK_KERNEL_END, kernel_end)?;
+    patch_u64(&mut shim, MARK_INITRAMFS_END, initramfs_end)?;
     let entry = KERNEL_BASE + info.entry_offset;
-    patch_u64(&mut shim, 0x3333333333333333, entry)?;
-    if info.setup_bytes > KERNEL_SETUP_AREA_SIZE {
+    patch_u64(&mut shim, MARK_ENTRY, entry)?;
+    if shim.len() != SHIM_SIZE as usize {
+        return Err("reset shim is not the single page the layout reserves".into());
+    }
+    if info.setup_bytes > KERNEL_SETUP_AREA_SIZE as usize {
         return Err("bzImage setup area exceeds its fixed measured reservation".into());
     }
-    let mut kernel_setup = vec![0u8; KERNEL_SETUP_AREA_SIZE];
+    let mut kernel_setup = vec![0u8; KERNEL_SETUP_AREA_SIZE as usize];
     kernel_setup[..info.setup_bytes].copy_from_slice(&kernel_file[..info.setup_bytes]);
 
     let shim_owned = zero.len()
@@ -149,6 +186,7 @@ pub fn build(kernel_path: &Path, initramfs_path: &Path, output: &Path) -> Result
         kernel_entry: format!("0x{entry:08x}"),
         expected_mrtd: hex::encode(expected_mrtd),
         shim_owned_bytes: shim_owned,
+        attestation: tdx_attestation(&expected_mrtd, mrconfigid),
         components,
     };
     let manifest_path = format!("{}.manifest.json", output.display());
@@ -158,8 +196,39 @@ pub fn build(kernel_path: &Path, initramfs_path: &Path, output: &Path) -> Result
     Ok(())
 }
 
+// MRTD covers only the pages this file provides.  ATTRIBUTES, XFAM, the vCPU
+// count and the owner registers are TD configuration the host picks at
+// TDH.MNG.INIT, so a TD launched with ATTRIBUTES.DEBUG set -- which lets the
+// host read guest memory and registers -- produces a byte-identical MRTD.
+// Checking the digest alone is therefore not a check at all.
+fn tdx_attestation(mrtd: &[u8; 48], mrconfigid: String) -> Required {
+    let mut r = Required::new();
+    r.insert("mrtd", Some(hex::encode(mrtd)));
+    // ATTRIBUTES.DEBUG (bit 0) must be clear and SEPT_VE_DISABLE (bit 28) set;
+    // no other bit is constrained, so the check is a masked compare.
+    r.insert(
+        "attributes_mask",
+        Some(format!("0x{:016x}", 0x1000_0001u64)),
+    );
+    r.insert("attributes", Some(format!("0x{:016x}", 0x1000_0000u64)));
+    // The TD's extended-feature mask is a launch parameter this build cannot
+    // predict; pin it to the value observed on a trusted first launch.
+    r.insert("xfam", None);
+    r.insert("mrconfigid", Some(mrconfigid));
+    r.insert("mrowner", Some(zeros(48)));
+    r.insert("mrownerconfig", Some(zeros(48)));
+    // This image performs no runtime measurement: it extends no RTMR and
+    // provides no event log, so every register is still at its reset value
+    // when Linux is entered.  Requiring zeros makes that verifiable and makes
+    // any later extension -- by the guest or anything else -- visible.
+    for name in ["rtmr0", "rtmr1", "rtmr2", "rtmr3"] {
+        r.insert(name, Some(zeros(48)));
+    }
+    r
+}
+
 fn page_tables() -> Vec<u8> {
-    let mut v = vec![0u8; 6 * PAGE as usize];
+    let mut v = vec![0u8; PAGE_TABLE_SIZE as usize];
     put64(&mut v, 0, (PAGE_TABLES + PAGE) | 3);
     for pdpt in 0..4 {
         put64(
@@ -193,7 +262,7 @@ fn validate_non_overlapping(pages: &[(u64, Vec<u8>, bool)]) -> Result<(), String
     }
     Ok(())
 }
-fn patch_u64(data: &mut [u8], marker: u64, value: u64) -> Result<(), String> {
+pub fn patch_u64(data: &mut [u8], marker: u64, value: u64) -> Result<(), String> {
     let needle = marker.to_le_bytes();
     let hits: Vec<_> = data
         .windows(8)
@@ -210,17 +279,14 @@ fn patch_u64(data: &mut [u8], marker: u64, value: u64) -> Result<(), String> {
     data[hits[0]..hits[0] + 8].copy_from_slice(&value.to_le_bytes());
     Ok(())
 }
-fn component(address: u64, data: &[u8]) -> Component {
+pub fn component(address: u64, data: &[u8]) -> Component {
     Component {
         address: format!("0x{address:08x}"),
         size: data.len(),
         sha256: hex::encode(Sha256::digest(data)),
     }
 }
-fn put64(v: &mut [u8], at: usize, n: u64) {
-    v[at..at + 8].copy_from_slice(&n.to_le_bytes());
-}
-fn io_error(action: &'static str) -> impl Fn(io::Error) -> String {
+pub fn io_error(action: &'static str) -> impl Fn(io::Error) -> String {
     move |e| format!("{action}: {e}")
 }
 
@@ -241,6 +307,16 @@ mod tests {
         );
     }
     #[test]
+    fn config_hash_is_pinned_or_zero() {
+        assert_eq!(config_field(None, 32), Ok(zeros(32)));
+        assert_eq!(
+            config_field(Some(&"AB".repeat(32)), 32),
+            Ok("ab".repeat(32))
+        );
+        assert!(config_field(Some("abcd"), 32).is_err());
+        assert!(config_field(Some(&"zz".repeat(32)), 32).is_err());
+    }
+    #[test]
     fn builds_byte_identical_parseable_images() {
         let dir = tempdir().unwrap();
         let kernel_path = dir.path().join("bzImage");
@@ -257,8 +333,8 @@ mod tests {
         kernel[0x260..0x264].copy_from_slice(&0x20_0000u32.to_le_bytes());
         fs::write(&kernel_path, kernel).unwrap();
         fs::write(&initramfs_path, b"test initramfs").unwrap();
-        build(&kernel_path, &initramfs_path, &a).unwrap();
-        build(&kernel_path, &initramfs_path, &b).unwrap();
+        build(&kernel_path, &initramfs_path, &a, None).unwrap();
+        build(&kernel_path, &initramfs_path, &b, None).unwrap();
         let one = fs::read(a).unwrap();
         let two = fs::read(b).unwrap();
         assert_eq!(one, two);

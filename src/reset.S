@@ -1,10 +1,20 @@
+.include "layout.inc"
 .section .reset,"ax"
+
+# Accept [lo, hi) as private memory.  Both bounds are layout symbols, or a
+# marker the packager patches with a size-dependent address.
+.macro accept lo, hi
+    movabs $\lo, %r12
+    movabs $\hi, %r13
+    call accept_range
+.endm
+
 .code64
 .global reset_start
 reset_start:
     cli
     cld
-    mov $0x00100000, %rax
+    mov $PAGE_TABLES, %rax
     mov %rax, %cr3
     mov $0xb, %eax
     xor %ecx, %ecx
@@ -13,46 +23,43 @@ reset_start:
     test %edx, %edx
     jnz ap_wait
 
-    mov $0x0010b000, %rsp
+    mov $BSP_STACK_TOP, %rsp
+
+    # Enter Linux on the measured GDT.  MRTD covers no vCPU state at all, so
+    # without this the descriptors Linux runs on until it installs its own
+    # table -- and the segment registers the 64-bit boot protocol requires --
+    # would be whatever the loader happened to leave behind.  SNP gets the
+    # same table from its measured VMSA and needs no equivalent here.
+    mov $GDT_PTR, %rax
+    lgdt (%rax)
+    mov $BOOT_DS, %eax
+    mov %eax, %ds
+    mov %eax, %es
+    mov %eax, %ss
+    mov %eax, %fs
+    mov %eax, %gs
+    push $BOOT_CS
+    lea 1f(%rip), %rax
+    push %rax
+    lretq
+1:
 
     # Accept usable low-memory ranges, skipping measured boot-data pages.
-    mov $0x00000000, %r12
-    mov $0x00007000, %r13
-    call accept_range
-    mov $0x00008000, %r12
-    mov $0x00020000, %r13
-    call accept_range
-    mov $0x00021000, %r12
-    mov $0x000e0000, %r13
-    call accept_range
-    mov $0x000e1000, %r12
-    mov $0x000f0000, %r13
-    call accept_range
-    mov $0x000f1000, %r12
-    mov $0x00100000, %r13
-    call accept_range
-    mov $0x00106000, %r12
-    mov $0x00107000, %r13
-    call accept_range
-    mov $0x00117000, %r12
-    mov $0x00120000, %r13
-    call accept_range
+    accept 0, ZERO_PAGE
+    accept ZERO_PAGE+PAGE, CMDLINE
+    accept CMDLINE+PAGE, ACPI_BASE
+    accept ACPI_BASE+PAGE, MAILBOX
+    accept MAILBOX+PAGE, PAGE_TABLES
+    accept PAGE_TABLES+PAGE_TABLE_SIZE, BSP_STACK
+    accept BSP_STACK_TOP, SHIM_BASE
 
     # Accept every initially-unaccepted page below 1 GiB. Use 2-MiB
-    # acceptance wherever alignment permits and 4-KiB pages at edges.
-    mov $0x00150000, %r12
-    mov $0x01000000, %r13
-    call accept_range
-    # Kernel end and initramfs pages are already accepted/measured. Their
-    # rounded ends are patched into these immediate slots by the packager.
-kernel_end_imm:
-    movabs $0x1111111111111111, %r12
-    mov $0x20000000, %r13
-    call accept_range
-initramfs_end_imm:
-    movabs $0x2222222222222222, %r12
-    mov $0x40000000, %r13
-    call accept_range
+    # acceptance wherever alignment permits and 4-KiB pages at edges.  The
+    # kernel and initramfs pages are already accepted and measured, so
+    # acceptance resumes at their rounded ends.
+    accept KERNEL_SETUP_END, KERNEL_BASE
+    accept MARK_KERNEL_END, INITRAMFS_BASE
+    accept MARK_INITRAMFS_END, RAM_SIZE
     jmp boot_kernel
 
 accept_range:
@@ -77,19 +84,19 @@ accept_4k:
     tdcall
     test %rax, %rax
     jnz halt
-    add $0x1000, %r12
+    add $PAGE, %r12
     jmp accept_range
 accept_done:
     ret
 
 boot_kernel:
-    mov $0x7000, %rsi
+    mov $ZERO_PAGE, %rsi
 entry_imm:
-    movabs $0x3333333333333333, %rax
+    movabs $MARK_ENTRY, %rax
     jmp *%rax
 
 ap_wait:
-    mov $0xf0000, %rbx
+    mov $MAILBOX, %rbx
 ap_poll:
     mov (%rbx), %eax
     cmp $1, %eax

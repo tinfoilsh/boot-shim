@@ -1,19 +1,33 @@
+.include "layout.inc"
 .section .reset,"ax"
+
+# Validate [lo, hi) as private memory.  Both bounds are layout symbols, or a
+# marker the packager patches with a size-dependent address.
+.macro validate lo, hi
+    movabs $\lo, %r12
+    movabs $\hi, %r13
+    call validate_range
+.endm
+
 .code32
 .global snp_reset_start
 snp_reset_start:
     cli
     cld
-    mov $0x0010b000, %esp
+    mov $BSP_STACK_TOP, %esp
 
-    # KVM's SNP VMSA starts with paging disabled (CR0=0x31).  Enter long
-    # mode in guest context instead of asking KVM to synthesize an already
-    # paged VMSA, which results in an immediate shutdown on SNP hardware.
+    # The VMSA hands us 32-bit protected mode with paging off (CR0=0x31), so
+    # the shim enters long mode itself.  A paged VMSA is possible -- KVM's
+    # sev_post_set_cr3() writes CR3 into the save area on KVM_SET_SREGS
+    # precisely so it reaches the VMSA -- but it would add CR0.PG, EFER.LME,
+    # EFER.LMA, CR3 and a 64-bit CS to the fields that must survive the
+    # loader's VMSA round-trip, and the build-time measurement depends on
+    # every one of them.  Enabling paging here keeps that list short.
     mov $0xc0000080, %ecx
     rdmsr
     or $0x900, %eax                 # EFER.LME | EFER.NXE
     wrmsr
-    mov $0x00100000, %eax
+    mov $PAGE_TABLES, %eax
     mov %eax, %cr3
     mov %cr0, %eax
     bts $31, %eax
@@ -21,13 +35,13 @@ snp_reset_start:
     call 1f
 1:  pop %eax
     add $(snp_long_mode-1b), %eax
-    push $0x10
+    push $BOOT_CS
     push %eax
     lret
 
 .code64
 snp_long_mode:
-    mov $0x18, %eax
+    mov $BOOT_DS, %eax
     mov %eax, %ds
     mov %eax, %es
     mov %eax, %ss
@@ -39,48 +53,26 @@ snp_long_mode:
     # validated here.  The launch-updated pages are already validated and are
     # skipped: revalidating them is the hypervisor page-aliasing attack.  No
     # CPUID, MSR, I/O, GHCB or exception dependency is permitted before Linux.
-    mov $0x00000000, %r12
-    mov $0x00007000, %r13
-    call validate_range
-    mov $0x00008000, %r12
-    mov $0x00020000, %r13
-    call validate_range
-    mov $0x00021000, %r12
-    mov $0x000a0000, %r13
-    call validate_range
-    # 0xa0000..0xc0000 is the VGA aperture: real MMIO, never PVALIDATEd.  The
-    # rest of the legacy region is RAM that Linux still reads unconditionally
-    # (probe_roms, the EBDA and DMI scans), so it has to be validated around
-    # the launch-updated ACPI, CPUID, Secrets and CC-blob pages.
-    mov $0x000c0000, %r12
-    mov $0x000e0000, %r13
-    call validate_range
-    mov $0x000e1000, %r12
-    mov $0x000f0000, %r13
-    call validate_range
-    mov $0x000f3000, %r12
-    mov $0x00100000, %r13
-    call validate_range
-    mov $0x00106000, %r12
-    mov $0x00107000, %r13
-    call validate_range
-    mov $0x00117000, %r12
-    mov $0x00120000, %r13
-    call validate_range
-    mov $0x00150000, %r12
-    mov $0x01000000, %r13
-    call validate_range
-    movabs $0x1111111111111111, %r12    # end of the measured kernel payload
-    mov $0x20000000, %r13
-    call validate_range
-    movabs $0x4444444444444444, %r12    # end of the measured initramfs
-    mov $0x40000000, %r13
-    call validate_range
+    validate 0, ZERO_PAGE
+    validate ZERO_PAGE+PAGE, CMDLINE
+    validate CMDLINE+PAGE, VGA_HOLE
+    # The VGA aperture is real MMIO and is never PVALIDATEd.  The rest of the
+    # legacy region is RAM that Linux still reads unconditionally (probe_roms,
+    # the EBDA and DMI scans), so it has to be validated around the
+    # launch-updated ACPI, CPUID, Secrets and CC-blob pages.
+    validate VGA_HOLE_END, ACPI_BASE
+    validate ACPI_BASE+PAGE, SNP_CPUID
+    validate SNP_CC_BLOB+PAGE, PAGE_TABLES
+    validate PAGE_TABLES+PAGE_TABLE_SIZE, BSP_STACK
+    validate BSP_STACK_TOP, SHIM_BASE
+    validate KERNEL_SETUP_END, KERNEL_BASE
+    validate MARK_KERNEL_END, INITRAMFS_BASE
+    validate MARK_INITRAMFS_END, RAM_SIZE
 
 snp_boot_kernel:
-    mov $0x7000, %rsi
+    mov $ZERO_PAGE, %rsi
 snp_entry:
-    movabs $0x3333333333333333, %rax
+    movabs $MARK_ENTRY, %rax
     call *%rax
 
 # Report an unexpected PVALIDATE outcome through the GHCB MSR termination
@@ -149,7 +141,7 @@ validate_4k:
     xor %eax, %eax
     mov $512, %ecx
     rep stosq
-    add $0x1000, %r12
+    add $PAGE, %r12
     jmp validate_range
 zero_2m:
     mov %r12, %rdi

@@ -94,38 +94,56 @@ pub fn zero_page_snp(
     Ok(page)
 }
 
+// The measured GDT and the 64 KiB BSP stack that grows down towards it.  A
+// selector is its own byte offset, so BOOT_CS32/BOOT_CS/BOOT_DS index this
+// table directly.  Both shims run on it: SNP loads it from the measured VMSA's
+// GDTR, TDX `lgdt`s the pseudo-descriptor that follows the entries.  Without
+// it Linux would be entered on whatever descriptors the loader left behind,
+// which no measurement covers.
+pub fn gdt_stack() -> Vec<u8> {
+    let mut v = vec![0u8; BSP_STACK_SIZE as usize];
+    put64(&mut v, BOOT_CS32 as usize, 0x00cf_9b00_0000_ffff);
+    put64(&mut v, BOOT_CS as usize, 0x00af_9b00_0000_ffff);
+    put64(&mut v, BOOT_DS as usize, 0x00cf_9300_0000_ffff);
+    let at = (GDT_PTR - BSP_STACK) as usize;
+    v[at..at + 2].copy_from_slice(&(GDT_LIMIT as u16).to_le_bytes());
+    put64(&mut v, at + 2, BSP_STACK);
+    v
+}
+
+const RAM: u32 = 1;
+const RESERVED: u32 = 2;
+const ACPI: u32 = 3;
+
 fn e820_snp() -> Vec<(u64, u64, u32)> {
-    const RESERVED: u32 = 2;
-    const RAM: u32 = 1;
-    const ACPI: u32 = 3;
     vec![
         (0, ZERO_PAGE, RESERVED),
         (ZERO_PAGE, PAGE, RESERVED),
         (ZERO_PAGE + PAGE, CMDLINE - ZERO_PAGE - PAGE, RAM),
         (CMDLINE, PAGE, RESERVED),
-        (CMDLINE + PAGE, 0x000a_0000 - CMDLINE - PAGE, RAM),
-        (0x000a_0000, 0x0004_0000, RESERVED),
+        (CMDLINE + PAGE, VGA_HOLE - CMDLINE - PAGE, RAM),
+        (VGA_HOLE, ACPI_BASE - VGA_HOLE, RESERVED),
         // Type 3, not RESERVED: under SEV ioremap() maps an e820 RESERVED
         // range decrypted, so ACPICA's late remap of the tables would read
         // ciphertext.  Only IORES_DESC_ACPI_TABLES keeps the C-bit set.
         (ACPI_BASE, PAGE, ACPI),
-        (ACPI_BASE + PAGE, 0x0002_0000 - PAGE, RESERVED),
-        (0x0010_0000, 0x0005_0000, RESERVED),
-        (0x0015_0000, RAM_SIZE - 0x0015_0000, RAM),
+        (ACPI_BASE + PAGE, PAGE_TABLES - ACPI_BASE - PAGE, RESERVED),
+        (PAGE_TABLES, KERNEL_SETUP_END - PAGE_TABLES, RESERVED),
+        (KERNEL_SETUP_END, RAM_SIZE - KERNEL_SETUP_END, RAM),
     ]
 }
 
 pub fn e820() -> Vec<(u64, u64, u32)> {
     vec![
-        (0, ZERO_PAGE, 2),
-        (ZERO_PAGE, PAGE, 2),
-        (ZERO_PAGE + PAGE, CMDLINE - ZERO_PAGE - PAGE, 1),
-        (CMDLINE, PAGE, 2),
-        (CMDLINE + PAGE, ACPI_BASE - CMDLINE - PAGE, 1),
-        (ACPI_BASE, PAGE, 3),
-        (ACPI_BASE + PAGE, 0x1f_000, 2),
-        (0x0010_0000, 0x50_000, 2),
-        (0x0015_0000, RAM_SIZE - 0x0015_0000, 1),
+        (0, ZERO_PAGE, RESERVED),
+        (ZERO_PAGE, PAGE, RESERVED),
+        (ZERO_PAGE + PAGE, CMDLINE - ZERO_PAGE - PAGE, RAM),
+        (CMDLINE, PAGE, RESERVED),
+        (CMDLINE + PAGE, ACPI_BASE - CMDLINE - PAGE, RAM),
+        (ACPI_BASE, PAGE, ACPI),
+        (ACPI_BASE + PAGE, PAGE_TABLES - ACPI_BASE - PAGE, RESERVED),
+        (PAGE_TABLES, KERNEL_SETUP_END - PAGE_TABLES, RESERVED),
+        (KERNEL_SETUP_END, RAM_SIZE - KERNEL_SETUP_END, RAM),
     ]
 }
 
@@ -135,10 +153,10 @@ fn get16(v: &[u8], at: usize) -> u16 {
 fn get32(v: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(v[at..at + 4].try_into().unwrap())
 }
-fn put32(v: &mut [u8], at: usize, n: u32) {
+pub fn put32(v: &mut [u8], at: usize, n: u32) {
     v[at..at + 4].copy_from_slice(&n.to_le_bytes());
 }
-fn put64(v: &mut [u8], at: usize, n: u64) {
+pub fn put64(v: &mut [u8], at: usize, n: u64) {
     v[at..at + 8].copy_from_slice(&n.to_le_bytes());
 }
 
@@ -155,6 +173,23 @@ mod tests {
         }
     }
     #[test]
+    fn gdt_is_addressed_by_its_own_selectors() {
+        let v = gdt_stack();
+        assert_eq!(v.len(), BSP_STACK_SIZE as usize);
+        // A null descriptor at 0 and a 64-bit code descriptor at __BOOT_CS.
+        assert_eq!(&v[..8], &[0u8; 8]);
+        assert_eq!(v[BOOT_CS as usize + 6] & 0x20, 0x20);
+        let at = (GDT_PTR - BSP_STACK) as usize;
+        assert_eq!(
+            u16::from_le_bytes(v[at..at + 2].try_into().unwrap()) as u64,
+            GDT_LIMIT
+        );
+        assert_eq!(
+            u64::from_le_bytes(v[at + 2..at + 10].try_into().unwrap()),
+            BSP_STACK
+        );
+    }
+    #[test]
     fn malformed_kernel_is_rejected() {
         assert!(parse_bzimage(&[0; 0x300]).is_err());
     }
@@ -162,10 +197,12 @@ mod tests {
     #[test]
     fn snp_e820_covers_one_gib_without_unaccepted_memory() {
         let map = e820_snp();
-        assert!(map.iter().all(|e| e.2 == 1 || e.2 == 2 || e.2 == 3));
-        assert!(map.iter().any(|e| e.0 == ACPI_BASE && e.2 == 3));
+        assert!(map
+            .iter()
+            .all(|e| e.2 == RAM || e.2 == RESERVED || e.2 == ACPI));
+        assert!(map.iter().any(|e| e.0 == ACPI_BASE && e.2 == ACPI));
         // The q35 legacy hole holds launch-updated pages and MMIO, never RAM.
-        assert!(map.iter().any(|e| e.0 == 0x000a_0000 && e.2 == 2));
+        assert!(map.iter().any(|e| e.0 == VGA_HOLE && e.2 == RESERVED));
         assert_eq!(map.first().unwrap().0, 0);
         assert_eq!(map.last().unwrap().0 + map.last().unwrap().1, RAM_SIZE);
         for pair in map.windows(2) {
