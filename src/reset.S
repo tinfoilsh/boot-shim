@@ -4,13 +4,10 @@
 .code32
 .global reset_start
 reset_start:
-    # TDH.VP.INIT starts every vCPU here in 32-bit protected mode with paging
-    # off, ESI holding the vCPU index, CS based at 4 GiB - 64 KiB and the data
-    # segments flat.  MRTD covers no vCPU state at all, so the first thing the
-    # shim does is replace the descriptors it was handed with the measured
-    # GDT; everything after this runs on a table the digest covers.
+    # TDH.VP.INIT starts every vCPU here in 32-bit protected mode, ESI the vCPU index.
     cli
     cld
+    # MRTD covers no vCPU state, so the handed-over descriptors give way to the measured GDT.
     mov $GDT_PTR, %eax
     lgdt (%eax)
     ljmp $BOOT_CS32, $(RESET_ALIAS + (flat32 - reset_start))
@@ -21,15 +18,13 @@ flat32:
     mov %eax, %ss
     mov %eax, %fs
     mov %eax, %gs
-    # The TDX module leaves EFER.LME set and EFER unwritable, so enabling PAE
-    # and paging is the whole transition to long mode.  Both control registers
-    # are read-modify-written: the module fixes bits in each (CR0.NE, CR4.MCE)
-    # and clearing one is a #GP.
+    # The module leaves EFER.LME set, so PAE and paging are the whole transition.
     mov %cr4, %eax
     bts $5, %eax
     mov %eax, %cr4
     mov $PAGE_TABLES, %eax
     mov %eax, %cr3
+    # Clearing a bit the module fixes in CR0 or CR4 is a #GP, so both are read-modify-written.
     mov %cr0, %eax
     bts $31, %eax
     mov %eax, %cr0
@@ -41,13 +36,7 @@ long_mode:
     jnz ap_wait
     mov $BSP_STACK_TOP, %rsp
 
-    # Accept every page of guest RAM.  Linux discovers unaccepted memory only
-    # through EFI, which this boot path does not provide.  The ranges come out
-    # of the measured data block below, where the packager wrote the exact
-    # complement of the regions it placed: the pages the loader added are
-    # already accepted and are skipped, because accepting one twice is how a
-    # page gets silently replaced.  There is no second copy of that map here
-    # to fall out of step with the one the digest covers.
+    # Linux finds unaccepted memory only through EFI, so guest RAM is accepted here.
     lea shim_data(%rip), %rbp
     add $8, %rbp
 accept_next:
@@ -65,11 +54,7 @@ boot_kernel:
     lea shim_data(%rip), %rax
     jmp *(%rax)
 
-# Accept [%r12, %r13) as private memory, preferring 2-MiB pages.  A frame that
-# already holds accepted pages reports TDX_PAGE_SIZE_MISMATCH and is retried
-# 4 KiB at a time; every other non-zero status is fatal, including the
-# already-accepted one that says this shim and its loader disagree about the
-# layout the digest covers.
+# Accept [%r12, %r13) as private memory, preferring 2-MiB pages; any other status is fatal.
 accept_range:
     cmp %r13, %r12
     jae accept_done
@@ -101,9 +86,7 @@ accept_2m:
 accept_done:
     ret
 
-# APs land here and stay until the operating system claims them through the
-# measured ACPI wakeup mailbox: a vCPU index is its APIC ID in the MADT this
-# image authors, so nothing outside the digest decides which CPU answers.
+# APs wait here until the OS claims them through the measured ACPI wakeup mailbox.
 ap_wait:
     mov $MAILBOX, %rbx
 ap_poll:
@@ -120,12 +103,7 @@ ap_poll:
     movl $0, (%rbx)
     jmp *%rax
 
-# Every reachable cause of this is a disagreement between the image and its
-# loader about which pages the digest covers.  Report it through
-# TDG.VP.VMCALL<ReportFatalError> -- the architectural channel for exactly
-# this, and the only thing this shim ever says to the host -- so the failure
-# reaches the operator instead of looking like a TD that hung.  R12 carries
-# the offending address; the TD halts either way.
+# TDG.VP.VMCALL<ReportFatalError> is the only thing this shim ever says to the host.
 die:
     mov $0x1c00, %ecx               # expose R10, R11 and R12 to the host
     xor %r10d, %r10d                # standard GHCI
@@ -137,13 +115,12 @@ fatal:
     hlt
     jmp fatal
 
-    # The kernel entry point and the ranges to accept, written by the packager
-    # into the measured page.  layout.rs pins the offset and the size.
+    # The kernel entry point and the ranges to accept, written here by the builder.
     .org SHIM_DATA
 shim_data:
     .fill SHIM_DATA_SIZE,1,0
 
-    .org 0xff0
+    .org RESET_VECTOR
 reset_vector:
     jmp reset_start
     .fill 0x1000-(.-reset_start),1,0

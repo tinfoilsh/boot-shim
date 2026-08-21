@@ -3,7 +3,7 @@ name = "tdx-shim"
 version = "0.1.0"
 edition = "2021"
 license = "BSD-2-Clause-Patent"
-description = "Measured TDX Linux boot stub and deterministic IGVM packager"
+description = "Deterministic IGVM images that boot Linux on Intel TDX and AMD SEV-SNP"
 build = "build.rs"
 
 [dependencies]

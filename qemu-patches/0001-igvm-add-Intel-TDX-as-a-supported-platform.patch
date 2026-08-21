@@ -1,0 +1,245 @@
+From 1c5eb24f7707c8f9345201e1b5cdbca3f585b880 Mon Sep 17 00:00:00 2001
+From: pty1 <pty1@tinfoil.sh>
+Date: Fri, 21 Aug 2026 00:43:53 +0000
+Subject: [PATCH] igvm: add Intel TDX as a supported platform
+
+An IGVM file states what TDVF metadata states: which pages the TDX module
+is handed at launch, and which of them are extended into MRTD.  Nothing in
+the TDX launch path depends on those pages having arrived in a flash
+image, so the loader can take them from an IGVM file instead and a TD no
+longer needs a firmware volume to boot.
+
+Wire IGVM_PLATFORM_TYPE_TDX to a new CGS_PLATFORM_TDX and give TdxGuest
+the two class methods the IGVM backend needs.  set_guest_state records
+each directive as a firmware entry pointing at the guest RAM the backend
+has already populated, so tdx_init_fw_mem_region() adds it with
+TDH.MEM.PAGE.ADD exactly as it adds a TDVF section, extending it into MRTD
+unless the directive was marked unmeasured.  Such an entry needs no
+staging buffer, which is what tdx_finalize_vm() skips when there is no
+flash image to stage from.
+
+IGVM has no VP context for TDX -- a TD has an architectural reset state --
+so an image conveys its entry point by placing a measured page at the
+reset vector, and nothing here sets initial vCPU state.
+
+Two things a TDVF image always carries are absent from an IGVM one:
+
+  - There is no TD HOB.  It is a TDVF convention rather than a TDX one: an
+    IGVM guest reads its memory map out of its own measured pages, so
+    there is no host-filled page to point the BSP at and it starts with
+    RCX clear.  tdx_get_hob_entry() therefore reports absence instead of
+    exiting, and tdx_parse_tdvf() keeps the requirement for the images
+    that do have to carry one.
+
+  - There is no flash MemoryRegion to discard once the pages have been
+    copied into private memory, because they were never anywhere else.
+
+While here, fix set_tdx_vm_uninitialized() freeing the firmware entries
+after clearing the pointer to them, and leaving nr_entries stale.
+
+Signed-off-by: pty1 <pty1@tinfoil.sh>
+---
+ backends/igvm.c                             | 13 +++-
+ include/system/confidential-guest-support.h |  1 +
+ target/i386/kvm/tdx.c                       | 83 +++++++++++++++++++--
+ 3 files changed, 88 insertions(+), 9 deletions(-)
+
+diff --git a/backends/igvm.c b/backends/igvm.c
+index 80e87fe..fe3c0fe 100644
+--- a/backends/igvm.c
++++ b/backends/igvm.c
+@@ -861,6 +861,7 @@ static int qigvm_supported_platform_compat_mask(QIgvm *ctx, Error **errp)
+     uint32_t compatibility_mask_sev = 0;
+     uint32_t compatibility_mask_sev_es = 0;
+     uint32_t compatibility_mask_sev_snp = 0;
++    uint32_t compatibility_mask_tdx = 0;
+     uint32_t compatibility_mask = 0;
+ 
+     header_count = igvm_header_count(ctx->file, IGVM_HEADER_SECTION_PLATFORM);
+@@ -919,6 +920,13 @@ static int qigvm_supported_platform_compat_mask(QIgvm *ctx, Error **errp)
+                         platform->highest_vtl, platform->shared_gpa_boundary)) {
+                     compatibility_mask_sev_snp = platform->compatibility_mask;
+                 }
++            } else if ((platform->platform_type == IGVM_PLATFORM_TYPE_TDX) &&
++                       ctx->machine_state->cgs) {
++                if (ctx->cgsc->check_support(
++                        CGS_PLATFORM_TDX, platform->platform_version,
++                        platform->highest_vtl, platform->shared_gpa_boundary)) {
++                    compatibility_mask_tdx = platform->compatibility_mask;
++                }
+             } else if (platform->platform_type == IGVM_PLATFORM_TYPE_NATIVE) {
+                 compatibility_mask = platform->compatibility_mask;
+             }
+@@ -926,7 +934,10 @@ static int qigvm_supported_platform_compat_mask(QIgvm *ctx, Error **errp)
+         }
+     }
+     /* Choose the strongest supported isolation technology */
+-    if (compatibility_mask_sev_snp != 0) {
++    if (compatibility_mask_tdx != 0) {
++        ctx->compatibility_mask = compatibility_mask_tdx;
++        ctx->platform_type = IGVM_PLATFORM_TYPE_TDX;
++    } else if (compatibility_mask_sev_snp != 0) {
+         ctx->compatibility_mask = compatibility_mask_sev_snp;
+         ctx->platform_type = IGVM_PLATFORM_TYPE_SEV_SNP;
+     } else if (compatibility_mask_sev_es != 0) {
+diff --git a/include/system/confidential-guest-support.h b/include/system/confidential-guest-support.h
+index 5dca717..b6db265 100644
+--- a/include/system/confidential-guest-support.h
++++ b/include/system/confidential-guest-support.h
+@@ -31,6 +31,7 @@ typedef enum ConfidentialGuestPlatformType {
+     CGS_PLATFORM_SEV,
+     CGS_PLATFORM_SEV_ES,
+     CGS_PLATFORM_SEV_SNP,
++    CGS_PLATFORM_TDX,
+ } ConfidentialGuestPlatformType;
+ 
+ typedef enum ConfidentialGuestMemoryType {
+diff --git a/target/i386/kvm/tdx.c b/target/i386/kvm/tdx.c
+index 8294dbd..03e49dc 100644
+--- a/target/i386/kvm/tdx.c
++++ b/target/i386/kvm/tdx.c
+@@ -184,8 +184,7 @@ static TdxFirmwareEntry *tdx_get_hob_entry(TdxGuest *tdx)
+             return entry;
+         }
+     }
+-    error_report("TDVF metadata doesn't specify TD_HOB location.");
+-    exit(1);
++    return NULL;
+ }
+ 
+ static void tdx_add_ram_entry(uint64_t address, uint64_t length,
+@@ -290,9 +289,11 @@ static void tdx_post_init_vcpus(void)
+     TdxFirmwareEntry *hob;
+     CPUState *cpu;
+ 
++    /* An IGVM image has no TD HOB, so its BSP starts with RCX clear. */
+     hob = tdx_get_hob_entry(tdx_guest);
+     CPU_FOREACH(cpu) {
+-        tdx_vcpu_ioctl(cpu, KVM_TDX_INIT_VCPU, 0, (void *)(uintptr_t)hob->address,
++        tdx_vcpu_ioctl(cpu, KVM_TDX_INIT_VCPU, 0,
++                       (void *)(uintptr_t)(hob ? hob->address : 0),
+                        &error_fatal);
+     }
+ }
+@@ -345,6 +346,9 @@ static void tdx_finalize_vm(Notifier *notifier, void *unused)
+     tdx_init_ram_entries();
+ 
+     for_each_tdx_fw_entry(tdvf, entry) {
++        if (!tdvf->mem_ptr) {
++            break; /* IGVM: entries already point at the loaded guest RAM */
++        }
+         switch (entry->type) {
+         case TDVF_SECTION_TYPE_BFV:
+         case TDVF_SECTION_TYPE_CFV:
+@@ -375,7 +379,10 @@ static void tdx_finalize_vm(Notifier *notifier, void *unused)
+     qsort(tdx_guest->ram_entries, tdx_guest->nr_ram_entries,
+           sizeof(TdxRamEntry), &tdx_ram_entry_compare);
+ 
+-    tdvf_hob_create(tdx_guest, tdx_get_hob_entry(tdx_guest));
++    entry = tdx_get_hob_entry(tdx_guest);
++    if (entry) {
++        tdvf_hob_create(tdx_guest, entry);
++    }
+ 
+     tdx_post_init_vcpus();
+     tdx_init_fw_mem_region();
+@@ -384,8 +391,10 @@ static void tdx_finalize_vm(Notifier *notifier, void *unused)
+      * TDVF image has been copied into private region above via
+      * KVM_MEMORY_MAPPING. It becomes useless.
+      */
+-    ram_block = tdx_guest->tdvf_mr->ram_block;
+-    ram_block_discard_shared_range(ram_block, 0, ram_block->max_length);
++    if (tdx_guest->tdvf_mr) {
++        ram_block = tdx_guest->tdvf_mr->ram_block;
++        ram_block_discard_shared_range(ram_block, 0, ram_block->max_length);
++    }
+ 
+     tdx_vm_ioctl(KVM_TDX_FINALIZE_VM, 0, NULL, &error_fatal);
+     CONFIDENTIAL_GUEST_SUPPORT(tdx_guest)->ready = true;
+@@ -425,8 +434,9 @@ static int set_tdx_vm_uninitialized(NotifierWithReturn *notifier,
+      * the firmware entries will be parsed again, see
+      * x86_firmware_configure() -> tdx_parse_tdvf()
+      */
+-    fw->entries = 0;
+     g_free(fw->entries);
++    fw->entries = NULL;
++    fw->nr_entries = 0;
+ 
+     return 0;
+ }
+@@ -1186,7 +1196,62 @@ int tdx_pre_create_vcpu(CPUState *cpu, Error **errp)
+ 
+ int tdx_parse_tdvf(void *flash_ptr, int size)
+ {
+-    return tdvf_parse_metadata(&tdx_guest->tdvf, flash_ptr, size);
++    int r = tdvf_parse_metadata(&tdx_guest->tdvf, flash_ptr, size);
++
++    /* Only an IGVM image may omit the TD HOB. */
++    if (r == 0 && !tdx_get_hob_entry(tdx_guest)) {
++        error_report("TDVF metadata doesn't specify TD_HOB location.");
++        return -EINVAL;
++    }
++    return r;
++}
++
++/*
++ * An IGVM file states what TDVF metadata states: which pages the TDX module is
++ * handed at launch, and which of them are extended into MRTD.  Each directive
++ * becomes a firmware entry and the existing launch path adds them all.  There
++ * is no VP context to apply -- a TD has an architectural reset state.
++ */
++static bool tdx_cgs_check_support(ConfidentialGuestPlatformType platform,
++                                  uint16_t platform_version,
++                                  uint8_t highest_vtl,
++                                  uint64_t shared_gpa_boundary)
++{
++    return (platform == CGS_PLATFORM_TDX) && (platform_version == 1) &&
++           (highest_vtl == 0) && (shared_gpa_boundary == 0);
++}
++
++static int tdx_cgs_set_guest_state(hwaddr gpa, uint8_t *ptr, uint64_t len,
++                                   ConfidentialGuestPageType memory_type,
++                                   uint16_t cpu_index, Error **errp)
++{
++    TdxFirmware *fw = &tdx_guest->tdvf;
++    uint32_t attributes;
++
++    switch (memory_type) {
++    case CGS_PAGE_TYPE_NORMAL:
++    case CGS_PAGE_TYPE_ZERO:
++        attributes = TDVF_SECTION_ATTRIBUTES_MR_EXTEND;
++        break;
++    case CGS_PAGE_TYPE_UNMEASURED:
++        attributes = 0;
++        break;
++    case CGS_PAGE_TYPE_REQUIRED_MEMORY:
++        return 0; /* carries no data: the TD accepts it itself */
++    default:
++        error_setg(errp, "TDX: unsupported IGVM page type %d", memory_type);
++        return -1;
++    }
++
++    fw->entries = g_renew(TdxFirmwareEntry, fw->entries, fw->nr_entries + 1);
++    fw->entries[fw->nr_entries++] = (TdxFirmwareEntry) {
++        .address = gpa,
++        .size = len,
++        .type = TDVF_SECTION_TYPE_BFV,
++        .attributes = attributes,
++        .mem_ptr = ptr,
++    };
++    return 0;
+ }
+ 
+ static void tdx_inject_interrupt(TdxGuest *tdx)
+@@ -1620,6 +1685,8 @@ static void tdx_guest_class_init(ObjectClass *oc, const void *data)
+ 
+     klass->kvm_init = tdx_kvm_init;
+     klass->can_rebuild_guest_state = true;
++    klass->check_support = tdx_cgs_check_support;
++    klass->set_guest_state = tdx_cgs_set_guest_state;
+     x86_klass->kvm_type = tdx_kvm_type;
+     x86_klass->cpu_instance_init = tdx_cpu_instance_init;
+     x86_klass->adjust_cpuid_features = tdx_adjust_cpuid_features;
+-- 
+2.53.0
+

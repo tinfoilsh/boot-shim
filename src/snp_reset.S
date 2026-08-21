@@ -3,18 +3,13 @@
 
 .code32
 .global snp_reset_start
+# Nothing before Linux may depend on CPUID, an MSR, I/O, the GHCB or an exception.
 snp_reset_start:
     cli
     cld
     mov $BSP_STACK_TOP, %esp
 
-    # The VMSA hands us 32-bit protected mode with paging off (CR0=0x31), so
-    # the shim enters long mode itself.  A paged VMSA is possible -- KVM's
-    # sev_post_set_cr3() writes CR3 into the save area on KVM_SET_SREGS
-    # precisely so it reaches the VMSA -- but it would add CR0.PG, EFER.LME,
-    # EFER.LMA, CR3 and a 64-bit CS to the fields that must survive the
-    # loader's VMSA round-trip, and the build-time measurement depends on
-    # every one of them.  Enabling paging here keeps that list short.
+    # The VMSA hands over 32-bit protected mode with paging off, so the shim enables it.
     mov $0xc0000080, %ecx
     rdmsr
     or $0x900, %eax                 # EFER.LME | EFER.NXE
@@ -40,14 +35,7 @@ snp_long_mode:
     mov %eax, %fs
     mov %eax, %gs
 
-    # Linux discovers unaccepted memory only through EFI, which this boot path
-    # does not provide, so every page of guest RAM has to be validated here.
-    # The ranges come out of the measured data block below, where the packager
-    # wrote the exact complement of the regions it placed: the launch-updated
-    # pages are already validated and are skipped, because revalidating them
-    # is the hypervisor page-aliasing attack.  There is no second copy of that
-    # map here to fall out of step with the one the digest covers.  No CPUID,
-    # MSR, I/O, GHCB or exception dependency is permitted before Linux.
+    # Linux finds unvalidated memory only through EFI, so guest RAM is validated here.
     lea shim_data(%rip), %rbp
     add $8, %rbp
 validate_next:
@@ -65,10 +53,7 @@ snp_boot_kernel:
     lea shim_data(%rip), %rax
     jmp *(%rax)
 
-# Report an unexpected PVALIDATE outcome through the GHCB MSR termination
-# request, the only host channel available before Linux installs a #VC
-# handler.  The reason set carries the carry flag and status, the reason code
-# the 2 MiB frame index of the offending GPA.
+# The GHCB MSR termination request is the only host channel before Linux's #VC handler.
 die:
     mov %r12, %rax
     shr $21, %rax
@@ -90,10 +75,7 @@ fatal:
     hlt
     jmp fatal
 
-# Validate [%r12, %r13) as private memory, preferring 2 MiB pages.  PVALIDATE
-# reports failure in EAX and sets CF for every one of them, so EAX has to be
-# examined first; CF alone only means "RMP entry unchanged", which for a
-# non-zero status is simply a restatement of the failure.
+# Validate [%r12, %r13) as private memory, preferring 2 MiB; PVALIDATE reports status in EAX.
 validate_range:
     cmp %r13, %r12
     jae validated
@@ -143,8 +125,7 @@ zero_2m:
 validated:
     ret
 
-    # The kernel entry point and the ranges to validate, written by the
-    # packager into the measured page.  layout.rs pins the offset and size.
+    # The kernel entry point and the ranges to validate, written here by the builder.
     .org SHIM_DATA
 shim_data:
     .fill SHIM_DATA_SIZE,1,0

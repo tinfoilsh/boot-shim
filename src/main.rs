@@ -4,7 +4,6 @@ mod image;
 mod layout;
 mod mrtd;
 mod snp;
-mod tdvf;
 use clap::{Args, Parser, Subcommand};
 use layout::{Params, DEFAULT_CBIT, DEFAULT_MEMORY, DEFAULT_VCPUS};
 use std::path::PathBuf;
@@ -19,9 +18,7 @@ struct Cli {
     command: Command,
 }
 
-/// The measured description of the guest, chosen at build time.  None of it is
-/// a property of the machine: every field lands in a measured page, so a
-/// change here is a change to the digest a verifier checks.
+/// The measured description of the guest, chosen at build time.
 #[derive(Args)]
 struct Common {
     #[arg(long)]
@@ -30,18 +27,13 @@ struct Common {
     initramfs: PathBuf,
     #[arg(long)]
     output: PathBuf,
-    /// Guest memory the measured E820 map describes.  Accepts 0x hex and
-    /// K/M/G suffixes.
+    /// Top of the guest-physical map, in 0x hex or with a K/M/G suffix.
     #[arg(long, default_value_t = DEFAULT_MEMORY, value_parser = parse_size)]
     memory: u64,
-    /// Kernel command line.  Measured whole; `no5lvl` is appended whatever is
-    /// given, because the measured page tables are four-level.
+    /// Linux command line, measured whole, with `no5lvl` always appended.
     #[arg(long)]
     cmdline: Option<String>,
-    /// A platform MMIO aperture, as BASE:SIZE.  Repeatable.  Nothing is loaded
-    /// there, the shim never accepts it and E820 reserves it.  There is no
-    /// default: by default the image describes a flat span of guest RAM and
-    /// assumes nothing about any particular VMM's legacy memory map.
+    /// A reserved physical range, as BASE:SIZE, repeatable.
     #[arg(long, value_name = "BASE:SIZE", value_parser = parse_hole)]
     mmio_hole: Vec<(u64, u64)>,
 }
@@ -51,11 +43,10 @@ enum Command {
     Build {
         #[command(flatten)]
         common: Common,
-        /// vCPUs the measured MADT advertises.
+        /// Processor count, which the measured MADT advertises.
         #[arg(long, default_value_t = DEFAULT_VCPUS)]
         vcpus: u32,
-        /// Deployment-specific value the host must pass as MRCONFIGID, 48
-        /// hex-encoded bytes.  Recorded in the manifest for the verifier.
+        /// MRCONFIGID the host must pass, 48 hex-encoded bytes.
         #[arg(long)]
         config_hash: Option<String>,
     },
@@ -63,18 +54,13 @@ enum Command {
     BuildSnp {
         #[command(flatten)]
         common: Common,
-        /// Deployment-specific value the host must pass as HOST_DATA, 32
-        /// hex-encoded bytes.  Recorded in the manifest for the verifier.
+        /// HOST_DATA the host must pass, 32 hex-encoded bytes.
         #[arg(long)]
         config_hash: Option<String>,
-        /// C-bit position the encrypted identity map is built around.  The
-        /// only CPU property that reaches the image, and nothing before Linux
-        /// may take a CPUID dependency to discover it, so it is stated here
-        /// and published in the manifest.
+        /// Encryption bit the identity map is built around, published in the manifest.
         #[arg(long, default_value_t = DEFAULT_CBIT)]
         cbit: u8,
-        /// PKCS#8 PEM P-384 key that signs the ID block.  Without one the
-        /// firmware enforces neither the launch digest nor the guest policy.
+        /// PKCS#8 PEM P-384 key that signs the ID block the firmware enforces.
         #[arg(long)]
         id_key: Option<PathBuf>,
         /// Anti-rollback version placed in the signed ID block.

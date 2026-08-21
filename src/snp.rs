@@ -25,17 +25,52 @@ use std::{collections::BTreeMap, fs, path::Path};
 use zerocopy::{AsBytes, FromZeroes};
 
 const COMPAT: u32 = 1;
+// IGVM states a required-memory span in 32 bits, so a larger guest takes several.
+const REQUIRED_MEMORY_MAX: u64 = 0xffff_f000;
+
+// The PAGE_INFO structure SNP_LAUNCH_UPDATE digests, one per launch page.
 const PAGE_INFO_LEN: u16 = 112;
+const PAGE_INFO_CONTENTS: usize = 48;
+const PAGE_INFO_LENGTH: usize = 96;
+const PAGE_INFO_TYPE: usize = 98;
+const PAGE_INFO_GPA: usize = 104;
 const PAGE_NORMAL: u8 = 1;
 const PAGE_VMSA: u8 = 2;
 const PAGE_SECRETS: u8 = 5;
 const PAGE_CPUID: u8 = 6;
+
 // "SEV Secure Nested Paging Firmware ABI" 8.18: ECDSA P-384 over SHA-384.
 const ID_KEY_ECDSA_P384: u32 = 1;
 const ID_CURVE_P384: u32 = 2;
-// The version QEMU stamps into the block it hands the firmware, so the
-// signature has to be computed over the same value.
+// QEMU stamps this version into the block, so the signature covers the same value.
 const ID_BLOCK_VERSION: u32 = 1;
+// The block the firmware verifies, and the fields the signature covers.
+const ID_BLOCK_LEN: usize = 0x60;
+const ID_BLOCK_LD: usize = 0;
+const ID_BLOCK_VERSION_AT: usize = 0x50;
+const ID_BLOCK_SVN: usize = 0x54;
+const ID_BLOCK_POLICY: usize = 0x58;
+// The firmware's own public key structure, which ID_KEY_DIGEST is taken over.
+const SEV_KEY_LEN: usize = 0x404;
+const SEV_KEY_CURVE: usize = 0;
+const SEV_KEY_QX: usize = 4;
+const SEV_KEY_QY: usize = 76;
+const ECDSA_COMPONENT_LEN: usize = 72;
+
+// The VMSA reset state, pinned here because the launch digest covers all of it.
+const VMSA_CR0: u64 = 0x31;
+const VMSA_CR4: u64 = 0x60;
+const VMSA_EFER: u64 = 0x1000;
+const VMSA_RFLAGS: u64 = 2;
+const VMSA_XCR0: u64 = 1;
+const VMSA_PAT: u64 = 0x0007_0406_0007_0406;
+const VMSA_DR6: u64 = 0xffff_0ff0;
+const VMSA_DR7: u64 = 0x400;
+const VMSA_MXCSR: u32 = 0x1f80;
+const VMSA_X87_FCW: u16 = 0x037f;
+const SEG_CODE32_ATTR: u16 = 0x0c9b;
+const SEG_DATA_ATTR: u16 = 0x0c93;
+const SEG_LIMIT: u32 = 0xffff_ffff;
 
 const SNP_SHIM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/snp_reset.bin"));
 const _: () = assert!(SNP_SHIM.len() == SHIM_SIZE as usize);
@@ -86,16 +121,15 @@ pub fn build(
     let p = prepare(kernel_path, initramfs_path, params)?;
     let acpi = acpi::build(SNP_VCPU_COUNT, false);
 
-    // The one authoritative map, exactly as on TDX: the E820 map, the pages
-    // the loader imports and the ranges the shim validates all come from it.
+    // The one authoritative map, as on TDX: E820, the imported pages and the accept list.
     let mut placed = vec![
-        // Filled in once the map it describes has been derived from it.
+        // Blank: the zero page describes the map it belongs to, so its contents come last.
         Placed::measured(ZERO_PAGE, RESERVED, vec![0u8; PAGE as usize]),
         Placed::measured(CMDLINE, RESERVED, p.command.clone()),
         Placed::measured(ACPI_BASE, ACPI, acpi.bytes.clone()),
         Placed::host(SNP_CPUID),
         Placed::host(SNP_SECRETS),
-        Placed::measured(SNP_CC_BLOB, RESERVED, cc_blob()),
+        Placed::measured(SNP_CC_BLOB, RAM, cc_blob()),
         Placed::measured(PAGE_TABLES, RESERVED, identity_map(params.cbit as u64)),
         Placed::measured(BSP_STACK, RESERVED, boot::gdt_stack()),
         Placed::measured(SHIM_BASE, RESERVED, vec![0u8; PAGE as usize]),
@@ -128,12 +162,13 @@ pub fn build(
     let mut pages = Vec::new();
     for region in &placed {
         match region.fill {
-            // The CPUID and Secrets pages carry contents the loader and the
-            // firmware supply; SNP_LAUNCH_UPDATE measures both by type and
-            // address with a zeroed CONTENTS field.
-            Fill::Host if region.base == SNP_CPUID => {
-                add_special(&mut pages, region.base, IgvmPageDataType::CPUID_DATA, PAGE_CPUID)
-            }
+            // The loader and firmware fill these two, so both are measured by address alone.
+            Fill::Host if region.base == SNP_CPUID => add_special(
+                &mut pages,
+                region.base,
+                IgvmPageDataType::CPUID_DATA,
+                PAGE_CPUID,
+            ),
             Fill::Host => add_special(
                 &mut pages,
                 region.base,
@@ -150,12 +185,10 @@ pub fn build(
     validate_vmsa(&directive_vmsa, params)?;
     let vmsa = vmsa_page(&directive_vmsa);
     let measurement = launch_measurement(&pages, &vmsa);
-    // IGVM states a required-memory span in 32 bits, so a larger guest is
-    // described by consecutive spans rather than silently truncated to one.
     let mut directives = Vec::new();
     let mut at = 0u64;
     while at < params.memory {
-        let bytes = (params.memory - at).min(0xffff_f000);
+        let bytes = (params.memory - at).min(REQUIRED_MEMORY_MAX);
         directives.push(IgvmDirectiveHeader::RequiredMemory {
             gpa: at,
             compatibility_mask: COMPAT,
@@ -245,13 +278,7 @@ pub fn build(
     write_manifest(output, &manifest)
 }
 
-// A signed ID block turns the launch digest from something a verifier checks
-// after the fact into something the SEV firmware enforces: SNP_LAUNCH_FINISH
-// fails unless the digest it computed and the policy the host asked for match
-// this block, and the block is signed, so neither can be swapped.  It also
-// carries GUEST_SVN, which is the only version this image has and therefore
-// the only thing a verifier can require a floor on; FAMILY_ID and IMAGE_ID
-// stay zero but are signed as such, so a host cannot invent values for them.
+// SNP_LAUNCH_FINISH fails unless the digest and policy match this signed block.
 struct IdBlock {
     header: IgvmDirectiveHeader,
     key_digest: [u8; 48],
@@ -259,14 +286,13 @@ struct IdBlock {
 
 fn id_block(pem: &str, ld: &[u8; 48], guest_svn: u32) -> Result<IdBlock, String> {
     let key = SigningKey::from_pkcs8_pem(pem).map_err(|e| format!("parse ID key: {e}"))?;
-    // The 0x60-byte block the firmware verifies.  QEMU rebuilds it from the
-    // IGVM header and substitutes the file's guest policy, so the signature
-    // has to cover exactly these bytes.
-    let mut block = [0u8; 0x60];
-    block[..48].copy_from_slice(ld);
-    block[0x50..0x54].copy_from_slice(&ID_BLOCK_VERSION.to_le_bytes());
-    block[0x54..0x58].copy_from_slice(&guest_svn.to_le_bytes());
-    block[0x58..0x60].copy_from_slice(&SNP_GUEST_POLICY.to_le_bytes());
+    // QEMU rebuilds the block from the IGVM header, so the signature covers these bytes.
+    let mut block = [0u8; ID_BLOCK_LEN];
+    block[ID_BLOCK_LD..ID_BLOCK_LD + 48].copy_from_slice(ld);
+    block[ID_BLOCK_VERSION_AT..ID_BLOCK_VERSION_AT + 4]
+        .copy_from_slice(&ID_BLOCK_VERSION.to_le_bytes());
+    block[ID_BLOCK_SVN..ID_BLOCK_SVN + 4].copy_from_slice(&guest_svn.to_le_bytes());
+    block[ID_BLOCK_POLICY..ID_BLOCK_POLICY + 8].copy_from_slice(&SNP_GUEST_POLICY.to_le_bytes());
     let signature: Signature = key.sign(&block);
     let point = key.verifying_key().to_encoded_point(false);
     let public = IGVM_VHS_SNP_ID_BLOCK_PUBLIC_KEY {
@@ -300,28 +326,24 @@ fn id_block(pem: &str, ld: &[u8; 48], guest_svn: u32) -> Result<IdBlock, String>
 }
 
 // The firmware stores every ECDSA component little-endian in a 72-byte field.
-fn le72(big_endian: &[u8]) -> [u8; 72] {
-    let mut v = [0u8; 72];
+fn le72(big_endian: &[u8]) -> [u8; ECDSA_COMPONENT_LEN] {
+    let mut v = [0u8; ECDSA_COMPONENT_LEN];
     for (at, byte) in big_endian.iter().rev().enumerate() {
         v[at] = *byte;
     }
     v
 }
 
-// ID_KEY_DIGEST in the attestation report is SHA-384 over the firmware's
-// 0x404-byte public key structure, not over the IGVM one, so a verifier can
-// only match it if the packager hashes the same layout.
+// ID_KEY_DIGEST is SHA-384 over the firmware's key structure, not the IGVM one.
 fn key_digest(public: &IGVM_VHS_SNP_ID_BLOCK_PUBLIC_KEY) -> [u8; 48] {
-    let mut sev_key = [0u8; 0x404];
-    sev_key[..4].copy_from_slice(&public.curve.to_le_bytes());
-    sev_key[4..76].copy_from_slice(&public.qx);
-    sev_key[76..148].copy_from_slice(&public.qy);
+    let mut sev_key = [0u8; SEV_KEY_LEN];
+    sev_key[SEV_KEY_CURVE..SEV_KEY_CURVE + 4].copy_from_slice(&public.curve.to_le_bytes());
+    sev_key[SEV_KEY_QX..SEV_KEY_QX + ECDSA_COMPONENT_LEN].copy_from_slice(&public.qx);
+    sev_key[SEV_KEY_QY..SEV_KEY_QY + ECDSA_COMPONENT_LEN].copy_from_slice(&public.qy);
     Sha384::digest(sev_key).into()
 }
 
-// The launch digest covers the pages and the VMSA and nothing else.  The guest
-// policy, the owner-supplied HOST_DATA, the launch IDs and the signer identity
-// are all separate report fields, so they have to be required separately.
+// The launch digest covers the pages and the VMSA; every other field is required here.
 fn snp_attestation(
     measurement: &[u8; 48],
     host_data: String,
@@ -336,28 +358,18 @@ fn snp_attestation(
     r.insert("image_id", Some(zeros(16)));
     r.insert("guest_svn", Some(guest_svn.to_string()));
     r.insert("host_data", Some(host_data));
-    // The guest policy cannot forbid SMT, so the report has to: PLATFORM_INFO
-    // records whether the host had SMT enabled at launch.
+    // The policy cannot forbid SMT, so PLATFORM_INFO is where the report records it.
     r.insert("platform_info_smt_en", Some("false".into()));
-    // RAPL turns guest power draw into a side channel the guest cannot defend
-    // against, and disabling it is the host's decision, so the report is the
-    // only place it can be checked.  TSME_EN and ECC_EN are in the same field
-    // but say nothing about guest isolation, so neither is constrained.
+    // RAPL turns guest power draw into a side channel, and the host decides whether it runs.
     r.insert("platform_info_rapl_dis", Some("true".into()));
-    // Ciphertext hiding stops the host reading guest ciphertext at all.  Not
-    // every platform offers it, so the deployer pins it to what theirs can do
-    // rather than this build demanding it.
+    // Ciphertext hiding keeps the host out of guest ciphertext; not every platform offers it.
     r.insert("platform_info_ciphertext_hiding_en", None);
-    // A masked chip key means the report is not signed by a key rooted in this
-    // CPU's endorsement key, which makes the rest of these checks unfounded.
+    // A masked chip key unroots the report from this CPU, leaving every other check unfounded.
     r.insert("signer_info_mask_chip_key", Some("false".into()));
-    // Without an ID block the firmware never compares its digest to anything,
-    // and both signer digests stay zero -- which is itself the check that says
-    // "this launch was unenforced".
+    // Both digests zero says the firmware compared its launch digest against nothing.
     r.insert("id_key_digest", Some(signed.map_or(zeros(48), hex::encode)));
     r.insert("author_key_digest", Some(zeros(48)));
-    // The platform TCB is a property of the host, not of this image; pin it to
-    // the floor the deployer is willing to accept.
+    // The platform TCB is the host's, so the operator pins an acceptable floor.
     r.insert("reported_tcb", None);
     r
 }
@@ -366,8 +378,8 @@ fn directive_vmsa() -> Box<SevVmsa> {
     let mut v = SevVmsa::new_box_zeroed();
     let data = SevSelector {
         selector: BOOT_DS as u16,
-        attrib: 0x0c93,
-        limit: 0xffff_ffff,
+        attrib: SEG_DATA_ATTR,
+        limit: SEG_LIMIT,
         base: 0,
     };
     v.es = data;
@@ -378,8 +390,8 @@ fn directive_vmsa() -> Box<SevVmsa> {
     // The VMSA enters 32-bit protected mode; the shim far-returns to BOOT_CS.
     v.cs = SevSelector {
         selector: BOOT_CS32 as u16,
-        attrib: 0x0c9b,
-        limit: 0xffff_ffff,
+        attrib: SEG_CODE32_ATTR,
+        limit: SEG_LIMIT,
         base: 0,
     };
     v.gdtr = SevSelector {
@@ -396,70 +408,58 @@ fn directive_vmsa() -> Box<SevVmsa> {
     };
     v.ldtr = v.idtr;
     v.tr = v.idtr;
-    // KVM-compatible SNP reset state.  The reset shim enables paging and
-    // long mode itself before using the encrypted identity map.
-    v.efer = 0x1000;
-    v.cr4 = 0x60;
+    // The KVM reset state the shim starts from, paging and long mode left to it.
+    v.efer = VMSA_EFER;
+    v.cr4 = VMSA_CR4;
     v.cr3 = 0;
-    v.cr0 = 0x31;
-    v.dr6 = 0xffff_0ff0;
-    v.dr7 = 0x400;
-    v.rflags = 2;
+    v.cr0 = VMSA_CR0;
+    v.dr6 = VMSA_DR6;
+    v.dr7 = VMSA_DR7;
+    v.rflags = VMSA_RFLAGS;
     v.rip = SHIM_BASE;
     v.rsp = BSP_STACK_TOP;
     v.rsi = ZERO_PAGE;
-    v.pat = 0x0007_0406_0007_0406;
-    v.xcr0 = 1;
-    // Architectural x86 reset values.  QEMU applies the GPRs, segments and
-    // control registers above from this file but not these, so they have to
-    // match the VMM's reset state for the measured VMSA to be identical.
-    // RDX is left zero deliberately: QEMU applies it from here too, so the
-    // CPU's family/model/stepping signature never reaches the measurement.
-    v.mxcsr = 0x1f80;
-    v.x87_fcw = 0x037f;
+    v.pat = VMSA_PAT;
+    v.xcr0 = VMSA_XCR0;
+    // RDX stays zero, so no CPU family, model or stepping reaches the measurement.
+    v.mxcsr = VMSA_MXCSR;
+    v.x87_fcw = VMSA_X87_FCW;
     v.sev_features = SevFeatures::new().with_snp(true);
     v
 }
 
-// Every field the launch digest depends on.  QEMU applies the GPRs, segments
-// and control registers from this file but supplies the rest from its own
-// reset state, so a VMM whose reset values differ in any of them produces a
-// different measurement -- and, with a signed ID block, a launch that fails on
-// hardware with nothing to point at.  Checking the whole pinned set here turns
-// that into a build failure the moment someone edits the table above.
+// QEMU supplies from its own reset state every field this file leaves unstated.
 fn validate_vmsa(v: &SevVmsa, params: &Params) -> Result<(), String> {
     let data = |s: &SevSelector, sel: u64, attrib: u16| {
-        s.selector == sel as u16 && s.attrib == attrib && s.limit == 0xffff_ffff && s.base == 0
+        s.selector == sel as u16 && s.attrib == attrib && s.limit == SEG_LIMIT && s.base == 0
     };
-    let pinned = v.cr0 == 0x31
+    let pinned = v.cr0 == VMSA_CR0
         && v.cr3 == 0
-        && v.cr4 == 0x60
-        && v.efer == 0x1000
+        && v.cr4 == VMSA_CR4
+        && v.efer == VMSA_EFER
         && v.rdx == 0
         && v.rip == SHIM_BASE
         && v.rsp == BSP_STACK_TOP
         && v.rsi == ZERO_PAGE
-        && v.rflags == 2
+        && v.rflags == VMSA_RFLAGS
         && v.vmpl == 0
-        && v.dr6 == 0xffff_0ff0
-        && v.dr7 == 0x400
-        && v.pat == 0x0007_0406_0007_0406
-        && v.xcr0 == 1
-        && v.mxcsr == 0x1f80
-        && v.x87_fcw == 0x037f
+        && v.dr6 == VMSA_DR6
+        && v.dr7 == VMSA_DR7
+        && v.pat == VMSA_PAT
+        && v.xcr0 == VMSA_XCR0
+        && v.mxcsr == VMSA_MXCSR
+        && v.x87_fcw == VMSA_X87_FCW
         && v.gdtr.base == BSP_STACK
         && v.gdtr.limit == GDT_LIMIT as u32
         && v.idtr.limit == 0
-        && data(&v.cs, BOOT_CS32, 0x0c9b)
-        && data(&v.ds, BOOT_DS, 0x0c93)
-        && data(&v.ss, BOOT_DS, 0x0c93)
+        && data(&v.cs, BOOT_CS32, SEG_CODE32_ATTR)
+        && data(&v.ds, BOOT_DS, SEG_DATA_ATTR)
+        && data(&v.ss, BOOT_DS, SEG_DATA_ATTR)
         && v.sev_features.into_bits() == SNP_SEV_FEATURES;
     if !pinned {
         return Err("SNP VMSA invariant failed".into());
     }
-    // The shim runs on the encrypted identity map built around this bit, and
-    // nothing before Linux may take a CPUID dependency to discover it, so the
-    // image states it and the manifest publishes it for the verifier.
+    // The shim runs on the encrypted identity map this bit builds.
     if params.cbit < 32 || params.cbit > 63 {
         return Err("SNP C-bit position is not a usable physical address bit".into());
     }
@@ -472,22 +472,39 @@ fn vmsa_page(vmsa: &SevVmsa) -> Vec<u8> {
     page
 }
 
-// A SETUP_CC_BLOB record for boot_params.hdr.setup_data, followed in the same
-// measured page by the cc_blob_sev_info it refers to.  Linux reads the u32
-// directly after the setup_data header as the blob's address, so the blob
-// itself must not sit there.
+// The setup_data record Linux reads, and the cc_blob_sev_info it addresses.
+const SETUP_DATA_TYPE: usize = 8;
+const SETUP_DATA_LEN: usize = 12;
+const SETUP_DATA_DATA: usize = 16;
+const SETUP_DATA_HEADER: u32 = 16;
+const SETUP_CC_BLOB: u32 = 7;
+// The blob follows the record in the same page, clear of the address Linux reads.
 const CC_BLOB_INFO: usize = 32;
+const CC_MAGIC: &[u8; 4] = b"AMDE";
+const CC_VERSION: usize = 4;
+const CC_SECRETS_PHYS: usize = 8;
+const CC_SECRETS_LEN: usize = 16;
+const CC_CPUID_PHYS: usize = 24;
+const CC_CPUID_LEN: usize = 32;
+
+// One measured page inside the E820 RAM map, where `memremap()` reads it as plaintext.
 fn cc_blob() -> Vec<u8> {
     let mut v = vec![0u8; PAGE as usize];
-    put32(&mut v, 8, 7); // SETUP_CC_BLOB
-    put32(&mut v, 12, 4);
-    put32(&mut v, 16, (SNP_CC_BLOB + CC_BLOB_INFO as u64) as u32);
-    v[CC_BLOB_INFO..CC_BLOB_INFO + 4].copy_from_slice(b"AMDE");
-    v[CC_BLOB_INFO + 4..CC_BLOB_INFO + 6].copy_from_slice(&1u16.to_le_bytes());
-    put64(&mut v, CC_BLOB_INFO + 8, SNP_SECRETS);
-    put32(&mut v, CC_BLOB_INFO + 16, PAGE as u32);
-    put64(&mut v, CC_BLOB_INFO + 24, SNP_CPUID);
-    put32(&mut v, CC_BLOB_INFO + 32, PAGE as u32);
+    put32(&mut v, SETUP_DATA_TYPE, SETUP_CC_BLOB);
+    // The record claims the whole page, so Linux reserves all of it.
+    put32(&mut v, SETUP_DATA_LEN, PAGE as u32 - SETUP_DATA_HEADER);
+    put32(
+        &mut v,
+        SETUP_DATA_DATA,
+        (SNP_CC_BLOB + CC_BLOB_INFO as u64) as u32,
+    );
+    v[CC_BLOB_INFO..CC_BLOB_INFO + 4].copy_from_slice(CC_MAGIC);
+    v[CC_BLOB_INFO + CC_VERSION..CC_BLOB_INFO + CC_VERSION + 2]
+        .copy_from_slice(&1u16.to_le_bytes());
+    put64(&mut v, CC_BLOB_INFO + CC_SECRETS_PHYS, SNP_SECRETS);
+    put32(&mut v, CC_BLOB_INFO + CC_SECRETS_LEN, PAGE as u32);
+    put64(&mut v, CC_BLOB_INFO + CC_CPUID_PHYS, SNP_CPUID);
+    put32(&mut v, CC_BLOB_INFO + CC_CPUID_LEN, PAGE as u32);
     v
 }
 
@@ -499,21 +516,18 @@ fn launch_measurement(pages: &[LaunchPage], vmsa: &[u8]) -> [u8; 48] {
     extend(digest, SNP_VMSA, PAGE_VMSA, vmsa)
 }
 
-// SNP_LAUNCH_UPDATE hashes page contents into PAGE_INFO only for NORMAL and
-// VMSA pages.  Every other type -- including the CPUID and Secrets pages,
-// whose contents the loader and firmware supply -- is measured by type and
-// address alone, with a zeroed CONTENTS field.
+// SNP_LAUNCH_UPDATE hashes page contents only for NORMAL and VMSA pages.
 fn extend(old: [u8; 48], gpa: u64, kind: u8, page: &[u8]) -> [u8; 48] {
     let content: [u8; 48] = match kind {
         PAGE_NORMAL | PAGE_VMSA => Sha384::digest(page).into(),
         _ => [0u8; 48],
     };
-    let mut info = [0u8; 112];
-    info[..48].copy_from_slice(&old);
-    info[48..96].copy_from_slice(&content);
-    info[96..98].copy_from_slice(&PAGE_INFO_LEN.to_le_bytes());
-    info[98] = kind;
-    info[104..112].copy_from_slice(&gpa.to_le_bytes());
+    let mut info = [0u8; PAGE_INFO_LEN as usize];
+    info[..PAGE_INFO_CONTENTS].copy_from_slice(&old);
+    info[PAGE_INFO_CONTENTS..PAGE_INFO_LENGTH].copy_from_slice(&content);
+    info[PAGE_INFO_LENGTH..PAGE_INFO_TYPE].copy_from_slice(&PAGE_INFO_LEN.to_le_bytes());
+    info[PAGE_INFO_TYPE] = kind;
+    info[PAGE_INFO_GPA..PAGE_INFO_GPA + 8].copy_from_slice(&gpa.to_le_bytes());
     Sha384::digest(info).into()
 }
 fn add_normal(out: &mut Vec<LaunchPage>, base: u64, data: &[u8]) {
@@ -569,8 +583,7 @@ mod tests {
         assert_eq!(v.x87_fcw, 0x037f);
         assert_eq!(v.rsi, ZERO_PAGE);
         assert!(validate_vmsa(&v, &params()).is_ok());
-        // Any drift in the reset state QEMU supplies rather than reads from
-        // this file changes the measurement, so none of it may go unchecked.
+        // Drift in the state QEMU supplies changes the measurement, so none goes unchecked.
         for break_it in [
             (|v: &mut SevVmsa| v.dr6 = 0) as fn(&mut SevVmsa),
             |v| v.dr7 = 0,
@@ -595,8 +608,7 @@ mod tests {
     #[test]
     fn tables_are_encrypted_identity_maps() {
         let p = identity_map(DEFAULT_CBIT as u64);
-        // The 1-GiB page covering [4 GiB, 5 GiB): past the old map's end, and
-        // the first entry a guest larger than 4 GiB depends on.
+        // The 1-GiB entry covering [4 GiB, 5 GiB), which a larger guest depends on.
         let at = (PAGE + 4 * 8) as usize;
         let e = u64::from_le_bytes(p[at..at + 8].try_into().unwrap());
         assert_eq!(e, (4 * GIB) | (1u64 << DEFAULT_CBIT) | 0x83);
@@ -606,7 +618,13 @@ mod tests {
         let c = cc_blob();
         let info = CC_BLOB_INFO;
         assert_eq!(u32::from_le_bytes(c[8..12].try_into().unwrap()), 7);
-        assert_eq!(u32::from_le_bytes(c[12..16].try_into().unwrap()), 4);
+        // The record claims the rest of its page so Linux reserves all of it.
+        assert_eq!(
+            u32::from_le_bytes(c[12..16].try_into().unwrap()) + SETUP_DATA_HEADER,
+            PAGE as u32
+        );
+        // ...and the chain ends here: `pcibios_device_add()` walks it long after boot.
+        assert_eq!(u64::from_le_bytes(c[0..8].try_into().unwrap()), 0);
         assert_eq!(
             u32::from_le_bytes(c[16..20].try_into().unwrap()) as u64,
             SNP_CC_BLOB + info as u64
@@ -623,8 +641,7 @@ mod tests {
     }
     #[test]
     fn measurement_matches_the_reference_implementation() {
-        // Known answer from sev-snp-measure's GCTX over the same page set:
-        // one normal page, a Secrets page, a CPUID page and the VMSA.
+        // Known answer from sev-snp-measure over one normal, Secrets, CPUID and VMSA page.
         let mut p = Vec::new();
         let mut data = vec![0u8; PAGE as usize];
         data[0] = 1;
@@ -657,10 +674,7 @@ mod tests {
     }
     const TEST_KEY: &str = "-----BEGIN PRIVATE KEY-----\nMIG2AgEAMBAGByqGSM49AgEGBSuBBAAiBIGeMIGbAgEBBDD0QDbBc0T8m1BaeqCi\nGs30ddBtXsErRa5QX3eaeSYi11MZKeppqiBMm/fTnGxPP5KhZANiAASckeCIZYA6\nb96kAUX3v1H2Sk2iG+J23noMD403RN6PcnjsZWTIFa28YQYERl1BHB11uqFBzFG/\nOxpazENHn+p1pqw7y1frLk6qB4Gyi48pTb49fUOfkfqAPXA1xjy1tUg=\n-----END PRIVATE KEY-----\n";
 
-    // The firmware verifies this signature over exactly these bytes before it
-    // will enforce anything, so the test rebuilds the block the way the
-    // firmware sees it -- including the public key round-tripped through the
-    // little-endian 72-byte fields -- and checks it against the signature.
+    // The firmware enforces nothing until it verifies this signature over these bytes.
     #[test]
     fn id_block_signature_covers_the_digest_and_the_policy() {
         use p384::ecdsa::{signature::Verifier, VerifyingKey};
@@ -684,11 +698,13 @@ mod tests {
         assert_eq!(author_key_enabled, 0);
         assert_eq!(id_public_key.curve, ID_CURVE_P384);
 
-        let mut signed = [0u8; 0x60];
-        signed[..48].copy_from_slice(&ld);
-        signed[0x50..0x54].copy_from_slice(&ID_BLOCK_VERSION.to_le_bytes());
-        signed[0x54..0x58].copy_from_slice(&7u32.to_le_bytes());
-        signed[0x58..0x60].copy_from_slice(&SNP_GUEST_POLICY.to_le_bytes());
+        let mut signed = [0u8; ID_BLOCK_LEN];
+        signed[ID_BLOCK_LD..ID_BLOCK_LD + 48].copy_from_slice(&ld);
+        signed[ID_BLOCK_VERSION_AT..ID_BLOCK_VERSION_AT + 4]
+            .copy_from_slice(&ID_BLOCK_VERSION.to_le_bytes());
+        signed[ID_BLOCK_SVN..ID_BLOCK_SVN + 4].copy_from_slice(&7u32.to_le_bytes());
+        signed[ID_BLOCK_POLICY..ID_BLOCK_POLICY + 8]
+            .copy_from_slice(&SNP_GUEST_POLICY.to_le_bytes());
         let point = p384::EncodedPoint::from_affine_coordinates(
             &be48(&id_public_key.qx).into(),
             &be48(&id_public_key.qy).into(),
@@ -702,11 +718,11 @@ mod tests {
         .unwrap();
         verifying.verify(&signed, &signature).unwrap();
         // A block signed for a different policy must not verify against ours.
-        signed[0x58] ^= 1;
+        signed[ID_BLOCK_POLICY] ^= 1;
         assert!(verifying.verify(&signed, &signature).is_err());
     }
 
-    fn be48(le: &[u8; 72]) -> [u8; 48] {
+    fn be48(le: &[u8; ECDSA_COMPONENT_LEN]) -> [u8; 48] {
         let mut v = [0u8; 48];
         for (at, byte) in le[..48].iter().rev().enumerate() {
             v[at] = *byte;
@@ -737,8 +753,7 @@ mod tests {
         assert_eq!(fs::read(a).unwrap(), fs::read(b).unwrap());
     }
 
-    /// The guest policy cannot express these, and the launch digest does not
-    /// cover them, so the report is the only place they can be required.
+    /// The policy cannot express these and the digest does not cover them.
     #[test]
     fn snp_attestation_pins_what_the_policy_cannot() {
         let r = snp_attestation(&[0u8; 48], zeros(32), 0, None);
@@ -747,10 +762,9 @@ mod tests {
         assert_eq!(r["platform_info_rapl_dis"], Some("true".into()));
         // A masked chip key leaves every other check in here unfounded.
         assert_eq!(r["signer_info_mask_chip_key"], Some("false".into()));
-        // Not every platform can hide ciphertext, so the deployer pins it.
+        // Not every platform can hide ciphertext, so the operator pins it.
         assert_eq!(r["platform_info_ciphertext_hiding_en"], None);
-        // Both signer digests zero is what says the firmware compared the
-        // launch digest against nothing at all.
+        // Both signer digests zero says the firmware compared the digest against nothing.
         assert_eq!(r["id_key_digest"], Some(zeros(48)));
         assert_eq!(r["author_key_digest"], Some(zeros(48)));
     }

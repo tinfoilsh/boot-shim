@@ -4,9 +4,7 @@ use std::{
     process::Command,
 };
 
-// The layout is defined once, in Rust, and re-emitted here as assembler
-// symbols.  The shims address memory through these names only, so a shim
-// cannot drift from the map the packager measures.
+// src/layout.rs re-emitted as assembler symbols, so the shims address the measured map.
 #[allow(dead_code)]
 mod layout {
     include!("src/layout.rs");

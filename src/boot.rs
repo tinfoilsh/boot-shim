@@ -1,9 +1,48 @@
 use crate::layout::*;
 
-const SETUP_HEADER: usize = 0x1f1;
-const E820_TABLE: usize = 0x2d0;
+// Setup header fields, named as in Documentation/arch/x86/boot.rst.
+const HDR_SETUP_SECTS: usize = 0x1f1;
+const HDR_BOOT_FLAG: usize = 0x1fe;
+const HDR_SIGNATURE: usize = 0x202;
+const HDR_VERSION: usize = 0x206;
+const HDR_TYPE_OF_LOADER: usize = 0x210;
+const HDR_LOADFLAGS: usize = 0x211;
+const HDR_CODE32_START: usize = 0x214;
+const HDR_RAMDISK_IMAGE: usize = 0x218;
+const HDR_RAMDISK_SIZE: usize = 0x21c;
+const HDR_CMD_LINE_PTR: usize = 0x228;
+const HDR_KERNEL_ALIGNMENT: usize = 0x230;
+const HDR_RELOCATABLE: usize = 0x234;
+const HDR_XLOADFLAGS: usize = 0x236;
+const HDR_CMDLINE_SIZE: usize = 0x238;
+const HDR_SETUP_DATA: usize = 0x250;
+const HDR_PREF_ADDRESS: usize = 0x258;
+const HDR_INIT_SIZE: usize = 0x260;
+// The span of the header the builder copies, and the least a bzImage must carry.
+const SETUP_HEADER: usize = HDR_SETUP_SECTS;
+const SETUP_HEADER_END: usize = 0x290;
+const SETUP_HEADER_MIN: usize = 0x268;
+// The 64-bit entry point sits this far into the protected-mode payload.
+const ENTRY_64_OFFSET: u64 = 0x200;
+
+const BOOT_FLAG: u16 = 0xaa55;
+const BOOT_PROTOCOL_2_12: u16 = 0x020c;
+const LOADFLAGS_LOADED_HIGH: u8 = 1;
+const LOADFLAGS_CAN_USE_HEAP: u8 = 0x80;
+const LOADER_TYPE_UNDEFINED: u8 = 0xff;
+const XLF_KERNEL_64: u8 = 1;
+
+const BP_ACPI_RSDP_ADDR: usize = 0x70;
+const BP_E820_ENTRIES: usize = 0x1e8;
+const BP_E820_TABLE: usize = 0x2d0;
+const E820_ENTRY_LEN: usize = 20;
 // boot_params has room for exactly this many E820 entries.
 const E820_MAX: usize = 128;
+
+// The Linux 64-bit boot protocol descriptors, addressed by the selectors above.
+const GDT_CODE32: u64 = 0x00cf_9b00_0000_ffff;
+const GDT_CODE64: u64 = 0x00af_9b00_0000_ffff;
+const GDT_DATA: u64 = 0x00cf_9300_0000_ffff;
 
 pub const RAM: u32 = 1;
 pub const RESERVED: u32 = 2;
@@ -19,46 +58,46 @@ pub struct KernelInfo {
 }
 
 pub fn parse_bzimage(image: &[u8]) -> Result<KernelInfo, String> {
-    if image.len() < 0x268 {
+    if image.len() < SETUP_HEADER_MIN {
         return Err("bzImage is shorter than its setup header".into());
     }
-    if get16(image, 0x1fe) != 0xaa55 || &image[0x202..0x206] != b"HdrS" {
+    if get16(image, HDR_BOOT_FLAG) != BOOT_FLAG
+        || &image[HDR_SIGNATURE..HDR_SIGNATURE + 4] != b"HdrS"
+    {
         return Err("not an x86 Linux bzImage".into());
     }
-    if get16(image, 0x206) < 0x020c {
+    if get16(image, HDR_VERSION) < BOOT_PROTOCOL_2_12 {
         return Err("Linux boot protocol 2.12 or newer is required".into());
     }
-    if image[0x211] & 1 == 0 {
+    if image[HDR_LOADFLAGS] & LOADFLAGS_LOADED_HIGH == 0 {
         return Err("kernel is not a bzImage".into());
     }
-    if image[0x236] & 1 == 0 {
+    if image[HDR_XLOADFLAGS] & XLF_KERNEL_64 == 0 {
         return Err("kernel does not advertise a 64-bit entry".into());
     }
-    // The payload goes to the fixed KERNEL_BASE whatever the kernel asked for,
-    // so a kernel that cannot be moved there has to be refused rather than
-    // loaded somewhere it will not run.
-    let alignment = get32(image, 0x230) as u64;
+    // The payload loads at the fixed KERNEL_BASE, so a kernel that cannot run there is refused.
+    let alignment = get32(image, HDR_KERNEL_ALIGNMENT) as u64;
     if alignment == 0 || !alignment.is_power_of_two() || !KERNEL_BASE.is_multiple_of(alignment) {
         return Err("kernel alignment is not satisfied by the fixed load address".into());
     }
-    if image[0x234] == 0 && get64(image, 0x258) != KERNEL_BASE {
+    if image[HDR_RELOCATABLE] == 0 && get64(image, HDR_PREF_ADDRESS) != KERNEL_BASE {
         return Err("kernel is not relocatable and prefers a different load address".into());
     }
-    let setup_sects = if image[0x1f1] == 0 {
+    let setup_sects = if image[HDR_SETUP_SECTS] == 0 {
         4
     } else {
-        image[0x1f1] as usize
+        image[HDR_SETUP_SECTS] as usize
     };
     let setup_bytes = (setup_sects + 1) * 512;
-    if setup_bytes + 0x200 >= image.len() {
+    if setup_bytes + ENTRY_64_OFFSET as usize >= image.len() {
         return Err("bzImage has no protected-mode payload".into());
     }
     Ok(KernelInfo {
         setup_bytes,
         protected_size: image.len() - setup_bytes,
-        entry_offset: 0x200,
-        init_size: get32(image, 0x260),
-        cmdline_max: get32(image, 0x238),
+        entry_offset: ENTRY_64_OFFSET,
+        init_size: get32(image, HDR_INIT_SIZE),
+        cmdline_max: get32(image, HDR_CMDLINE_SIZE),
     })
 }
 
@@ -70,22 +109,25 @@ pub fn zero_page(
     e820: &[(u64, u64, u32)],
 ) -> Result<Vec<u8>, String> {
     if e820.len() > E820_MAX {
-        return Err(format!("E820 map needs {} of {E820_MAX} entries", e820.len()));
+        return Err(format!(
+            "E820 map needs {} of {E820_MAX} entries",
+            e820.len()
+        ));
     }
     let mut page = vec![0u8; PAGE as usize];
-    page[SETUP_HEADER..0x290].copy_from_slice(&setup[SETUP_HEADER..0x290]);
-    page[0x210] = 0xff;
-    page[0x211] |= 0x80;
-    put32(&mut page, 0x218, INITRAMFS_BASE as u32);
-    put32(&mut page, 0x21c, initramfs_len as u32);
-    put32(&mut page, 0x228, CMDLINE as u32);
-    put32(&mut page, 0x214, KERNEL_BASE as u32);
-    put32(&mut page, 0x260, info.init_size);
-    put64(&mut page, 0x70, rsdp);
+    page[SETUP_HEADER..SETUP_HEADER_END].copy_from_slice(&setup[SETUP_HEADER..SETUP_HEADER_END]);
+    page[HDR_TYPE_OF_LOADER] = LOADER_TYPE_UNDEFINED;
+    page[HDR_LOADFLAGS] |= LOADFLAGS_CAN_USE_HEAP;
+    put32(&mut page, HDR_RAMDISK_IMAGE, INITRAMFS_BASE as u32);
+    put32(&mut page, HDR_RAMDISK_SIZE, initramfs_len as u32);
+    put32(&mut page, HDR_CMD_LINE_PTR, CMDLINE as u32);
+    put32(&mut page, HDR_CODE32_START, KERNEL_BASE as u32);
+    put32(&mut page, HDR_INIT_SIZE, info.init_size);
+    put64(&mut page, BP_ACPI_RSDP_ADDR, rsdp);
 
-    page[0x1e8] = e820.len() as u8;
+    page[BP_E820_ENTRIES] = e820.len() as u8;
     for (index, entry) in e820.iter().enumerate() {
-        let at = E820_TABLE + index * 20;
+        let at = BP_E820_TABLE + index * E820_ENTRY_LEN;
         put64(&mut page, at, entry.0);
         put64(&mut page, at + 8, entry.1);
         put32(&mut page, at + 16, entry.2);
@@ -101,44 +143,34 @@ pub fn zero_page_snp(
     e820: &[(u64, u64, u32)],
 ) -> Result<Vec<u8>, String> {
     let mut page = zero_page(setup, info, initramfs_len, rsdp, e820)?;
-    // boot_params.hdr.setup_data -> measured SETUP_CC_BLOB record.
-    put64(&mut page, 0x250, SNP_CC_BLOB);
+    // The setup_data chain is one measured SETUP_CC_BLOB record.
+    put64(&mut page, HDR_SETUP_DATA, SNP_CC_BLOB);
     Ok(page)
 }
 
-// The measured GDT and the 64 KiB BSP stack that grows down towards it.  A
-// selector is its own byte offset, so BOOT_CS32/BOOT_CS/BOOT_DS index this
-// table directly.  Both shims run on it: SNP loads it from the measured VMSA's
-// GDTR, TDX `lgdt`s the pseudo-descriptor that follows the entries.  Without
-// it Linux would be entered on whatever descriptors the loader left behind,
-// which no measurement covers.
+// The measured GDT at the base of the BSP stack, which grows down from the far end.
 pub fn gdt_stack() -> Vec<u8> {
     let mut v = vec![0u8; BSP_STACK_SIZE as usize];
-    put64(&mut v, BOOT_CS32 as usize, 0x00cf_9b00_0000_ffff);
-    put64(&mut v, BOOT_CS as usize, 0x00af_9b00_0000_ffff);
-    put64(&mut v, BOOT_DS as usize, 0x00cf_9300_0000_ffff);
+    put64(&mut v, BOOT_CS32 as usize, GDT_CODE32);
+    put64(&mut v, BOOT_CS as usize, GDT_CODE64);
+    put64(&mut v, BOOT_DS as usize, GDT_DATA);
     let at = (GDT_PTR - BSP_STACK) as usize;
     v[at..at + 2].copy_from_slice(&(GDT_LIMIT as u16).to_le_bytes());
     put64(&mut v, at + 2, BSP_STACK);
     v
 }
 
-/// What a placed span holds.  Ordinary RAM is everything these leave over.
+/// What a placed span holds; ordinary RAM is everything these leave over.
 pub enum Fill {
     /// Contents this file provides and measures.
     Measured(Vec<u8>),
-    /// One page whose contents the loader or the firmware supplies: the TD HOB
-    /// on TDX, the CPUID and Secrets pages on SNP.  Declared and measured by
-    /// address, never by content, and never accepted by a shim.
+    /// One SNP page the firmware fills: measured by address, never by content.
     Host,
-    /// A platform MMIO aperture the deployer declared.  Not memory: nothing is
-    /// loaded there and no shim ever accepts it.
+    /// A declared MMIO aperture: nothing is loaded there and no shim accepts it.
     Mmio(u64),
 }
 
-/// A span of the guest map this image places.  One list decides all three of
-/// the E820 map Linux boots on, the sections the loader is told to add, and
-/// the ranges the shim accepts -- so those three cannot drift apart.
+/// A span of the guest map, from which the E820 map, the file and the accept list follow.
 pub struct Placed {
     pub base: u64,
     pub e820: u32,
@@ -183,9 +215,7 @@ impl Placed {
     }
 }
 
-/// Fill in the contents of an already-placed region.  The replacement has to
-/// occupy the same span, so a map derived from the region before it was filled
-/// -- the zero page describes the very map it belongs to -- stays valid.
+/// Fills a placed region, keeping its span so a map already derived from it holds.
 pub fn fill(placed: &mut [Placed], base: u64, data: Vec<u8>) -> Result<(), String> {
     let region = placed
         .iter_mut()
@@ -208,8 +238,7 @@ fn spans(placed: &[Placed]) -> Vec<(u64, u64, u32)> {
     v
 }
 
-/// Rejects a map whose placed spans overlap, which would otherwise become an
-/// E820 map and an accept list that disagree about who owns a page.
+/// Rejects overlapping spans, which reach Linux as an E820 map and an accept list that disagree.
 pub fn validate(placed: &[Placed], memory: u64) -> Result<(), String> {
     for pair in spans(placed).windows(2) {
         if pair[0].1 > pair[1].0 {
@@ -230,8 +259,7 @@ pub fn validate(placed: &[Placed], memory: u64) -> Result<(), String> {
     Ok(())
 }
 
-/// The E820 map Linux boots on: every placed span under its own type, every
-/// gap between them as RAM, adjacent runs of a type coalesced.
+/// The E820 map: each placed span under its own type, each gap RAM, adjacent runs coalesced.
 pub fn e820(placed: &[Placed], memory: u64) -> Vec<(u64, u64, u32)> {
     let mut out: Vec<(u64, u64, u32)> = Vec::new();
     let mut push = |base: u64, end: u64, kind: u32| {
@@ -256,9 +284,7 @@ pub fn e820(placed: &[Placed], memory: u64) -> Vec<(u64, u64, u32)> {
     out
 }
 
-/// The ranges a shim accepts: [0, memory) minus everything placed.  The loader
-/// already accepted the pages it loaded, and accepting one twice is how a page
-/// gets silently replaced, so the complement is exactly the right list.
+/// The ranges a shim accepts: [0, memory) minus everything the loader already accepted.
 pub fn accept_ranges(placed: &[Placed], memory: u64) -> Vec<(u64, u64)> {
     let mut out = Vec::new();
     let mut at = 0;
@@ -297,7 +323,7 @@ mod tests {
         vec![
             Placed::measured(ZERO_PAGE, RESERVED, vec![0; PAGE as usize]),
             Placed::measured(ACPI_BASE, ACPI, vec![0; PAGE as usize]),
-            Placed::host(TD_HOB),
+            Placed::host(SNP_SECRETS),
             Placed::measured(KERNEL_BASE, RAM, vec![0; PAGE as usize]),
         ]
     }
@@ -312,8 +338,7 @@ mod tests {
             assert_eq!(pair[0].0 + pair[0].1, pair[1].0);
         }
         assert!(e.iter().any(|x| x.0 == ACPI_BASE && x.2 == ACPI));
-        // A measured region that Linux may still use stays RAM, and coalesces
-        // with the RAM around it rather than punching a hole in it.
+        // A measured region Linux may use stays RAM and coalesces with the RAM around it.
         assert!(!e.iter().any(|x| x.0 == KERNEL_BASE));
     }
 
@@ -356,7 +381,7 @@ mod tests {
     fn gdt_is_addressed_by_its_own_selectors() {
         let v = gdt_stack();
         assert_eq!(v.len(), BSP_STACK_SIZE as usize);
-        // A null descriptor at 0 and a 64-bit code descriptor at __BOOT_CS.
+        // A null descriptor at 0 and a 64-bit code descriptor at BOOT_CS.
         assert_eq!(&v[..8], &[0u8; 8]);
         assert_eq!(v[BOOT_CS as usize + 6] & 0x20, 0x20);
         let at = (GDT_PTR - BSP_STACK) as usize;
