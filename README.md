@@ -54,10 +54,10 @@ Each command writes an IGVM file and an adjacent JSON manifest. The manifest con
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `--memory` | `1G` | Top of the guest-physical map |
+| `--ram` | `1G` | Guest RAM, matching QEMU `-m` |
 | `--vcpus` | `4` | TDX processor count |
 | `--cmdline` | `panic=-1` | Linux command line |
-| `--mmio-hole` | none | Reserved physical range |
+| `--mmio-hole` | none | Additional MMIO aperture |
 | `--config-hash` | zero | TDX `MRCONFIGID` or SNP `HOST_DATA` |
 | `--cbit` | `51` | SNP encryption bit |
 | `--guest-svn` | `0` | SNP anti-rollback version |
@@ -95,12 +95,12 @@ With `--id-key`, the builder signs an ID block containing the expected measureme
 
 ## Memory map
 
-`--memory` specifies the top of the physical map, not necessarily the amount of RAM. Declare MMIO apertures with `--mmio-hole`.
+`--ram` specifies the amount of guest RAM. For q35 guests with at least 2816 MiB, the builder places 2 GiB below 4 GiB, places the rest above 4 GiB, and derives the PCI aperture. Declare any additional MMIO apertures with `--mmio-hole`.
 
-For a q35 guest with 16 GiB of RAM and a 2 GiB PCI hole:
+For a q35 guest with 16 GiB of RAM:
 
 ```sh
---memory 18G --mmio-hole 0x80000000:0x80000000
+--ram 16G
 ```
 
 Use the matching QEMU layout:
@@ -109,7 +109,7 @@ Use the matching QEMU layout:
 -m 16G -machine q35,max-ram-below-4g=2G,...
 ```
 
-Private-memory initialization is linear in `--memory`. Large SNP guests may spend several seconds validating and clearing RAM.
+Private-memory initialization is linear in `--ram`. Large SNP guests may spend several seconds validating and clearing RAM.
 
 ## Linux requirements
 
