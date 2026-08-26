@@ -23,7 +23,7 @@ const SETUP_HEADER: usize = HDR_SETUP_SECTS;
 const SETUP_HEADER_END: usize = 0x290;
 const SETUP_HEADER_MIN: usize = 0x268;
 // The 64-bit entry point sits this far into the protected-mode payload.
-const ENTRY_64_OFFSET: u64 = 0x200;
+pub const ENTRY_64_OFFSET: u64 = 0x200;
 
 const BOOT_FLAG: u16 = 0xaa55;
 const BOOT_PROTOCOL_2_12: u16 = 0x020c;
@@ -47,12 +47,11 @@ const GDT_DATA: u64 = 0x00cf_9300_0000_ffff;
 pub const RAM: u32 = 1;
 pub const RESERVED: u32 = 2;
 pub const ACPI: u32 = 3;
+pub const ABSENT: u32 = 0;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy)]
 pub struct KernelInfo {
     pub setup_bytes: usize,
-    pub protected_size: usize,
-    pub entry_offset: u64,
     pub init_size: u32,
     pub cmdline_max: u32,
 }
@@ -94,8 +93,6 @@ pub fn parse_bzimage(image: &[u8]) -> Result<KernelInfo, String> {
     }
     Ok(KernelInfo {
         setup_bytes,
-        protected_size: image.len() - setup_bytes,
-        entry_offset: ENTRY_64_OFFSET,
         init_size: get32(image, HDR_INIT_SIZE),
         cmdline_max: get32(image, HDR_CMDLINE_SIZE),
     })
@@ -107,6 +104,7 @@ pub fn zero_page(
     initramfs_len: usize,
     rsdp: u64,
     e820: &[(u64, u64, u32)],
+    setup_data: u64,
 ) -> Result<Vec<u8>, String> {
     if e820.len() > E820_MAX {
         return Err(format!(
@@ -124,6 +122,8 @@ pub fn zero_page(
     put32(&mut page, HDR_CODE32_START, KERNEL_BASE as u32);
     put32(&mut page, HDR_INIT_SIZE, info.init_size);
     put64(&mut page, BP_ACPI_RSDP_ADDR, rsdp);
+    // TDX chains nothing here; SNP chains one SETUP_CC_BLOB record.
+    put64(&mut page, HDR_SETUP_DATA, setup_data);
 
     page[BP_E820_ENTRIES] = e820.len() as u8;
     for (index, entry) in e820.iter().enumerate() {
@@ -132,19 +132,6 @@ pub fn zero_page(
         put64(&mut page, at + 8, entry.1);
         put32(&mut page, at + 16, entry.2);
     }
-    Ok(page)
-}
-
-pub fn zero_page_snp(
-    setup: &[u8],
-    info: KernelInfo,
-    initramfs_len: usize,
-    rsdp: u64,
-    e820: &[(u64, u64, u32)],
-) -> Result<Vec<u8>, String> {
-    let mut page = zero_page(setup, info, initramfs_len, rsdp, e820)?;
-    // The setup_data chain is one measured SETUP_CC_BLOB record.
-    put64(&mut page, HDR_SETUP_DATA, SNP_CC_BLOB);
     Ok(page)
 }
 
@@ -162,7 +149,6 @@ pub fn gdt_stack() -> Vec<u8> {
 
 /// What a placed span holds; ordinary RAM is everything these leave over.
 pub enum Fill {
-    /// Contents this file provides and measures.
     Measured(Vec<u8>),
     /// One SNP page the firmware fills: measured by address, never by content.
     Host,
@@ -173,14 +159,17 @@ pub enum Fill {
 /// A span of the guest map, from which the E820 map, the file and the accept list follow.
 pub struct Placed {
     pub base: u64,
+    /// What the manifest publishes this region as; empty leaves it out.
+    pub name: &'static str,
     pub e820: u32,
     pub fill: Fill,
 }
 
 impl Placed {
-    pub fn measured(base: u64, e820: u32, data: Vec<u8>) -> Placed {
+    pub fn measured(base: u64, name: &'static str, e820: u32, data: Vec<u8>) -> Placed {
         Placed {
             base,
+            name,
             e820,
             fill: Fill::Measured(data),
         }
@@ -188,6 +177,7 @@ impl Placed {
     pub fn host(base: u64) -> Placed {
         Placed {
             base,
+            name: "",
             e820: RESERVED,
             fill: Fill::Host,
         }
@@ -195,11 +185,11 @@ impl Placed {
     pub fn mmio(base: u64, size: u64) -> Placed {
         Placed {
             base,
-            e820: RESERVED,
+            name: "",
+            e820: ABSENT,
             fill: Fill::Mmio(size),
         }
     }
-    /// The page-aligned span this occupies in the guest map.
     pub fn span(&self) -> u64 {
         match &self.fill {
             Fill::Measured(d) => align_up(d.len() as u64, PAGE).max(PAGE),
@@ -213,6 +203,17 @@ impl Placed {
             _ => &[],
         }
     }
+}
+
+/// The whole 4-KiB pages a region's contents occupy, the last one zero-padded.
+pub fn pages(base: u64, data: &[u8]) -> impl Iterator<Item = (u64, Vec<u8>)> + '_ {
+    data.chunks(PAGE as usize)
+        .enumerate()
+        .map(move |(i, chunk)| {
+            let mut page = vec![0u8; PAGE as usize];
+            page[..chunk.len()].copy_from_slice(chunk);
+            (base + i as u64 * PAGE, page)
+        })
 }
 
 /// Fills a placed region, keeping its span so a map already derived from it holds.
@@ -238,7 +239,7 @@ fn spans(placed: &[Placed]) -> Vec<(u64, u64, u32)> {
     v
 }
 
-/// Rejects overlapping spans, which reach Linux as an E820 map and an accept list that disagree.
+/// Overlapping spans reach Linux as an E820 map and an accept list that disagree.
 pub fn validate(placed: &[Placed], memory: u64) -> Result<(), String> {
     for pair in spans(placed).windows(2) {
         if pair[0].1 > pair[1].0 {
@@ -277,7 +278,9 @@ pub fn e820(placed: &[Placed], memory: u64) -> Vec<(u64, u64, u32)> {
             break;
         }
         push(at, lo, RAM);
-        push(lo.max(at), hi.min(memory), kind);
+        if kind != ABSENT {
+            push(lo.max(at), hi.min(memory), kind);
+        }
         at = at.max(hi);
     }
     push(at, memory, RAM);
@@ -321,31 +324,30 @@ mod tests {
 
     fn map() -> Vec<Placed> {
         vec![
-            Placed::measured(ZERO_PAGE, RESERVED, vec![0; PAGE as usize]),
-            Placed::measured(ACPI_BASE, ACPI, vec![0; PAGE as usize]),
+            Placed::measured(ZERO_PAGE, "", RESERVED, vec![0; PAGE as usize]),
+            Placed::measured(ACPI_BASE, "", ACPI, vec![0; PAGE as usize]),
             Placed::host(SNP_SECRETS),
-            Placed::measured(KERNEL_BASE, RAM, vec![0; PAGE as usize]),
+            Placed::measured(KERNEL_BASE, "", RAM, vec![0; PAGE as usize]),
         ]
     }
 
     #[test]
     fn e820_tiles_the_whole_span_without_gaps() {
         let map = map();
-        let e = e820(&map, DEFAULT_MEMORY);
+        let e = e820(&map, DEFAULT_RAM);
         assert_eq!(e.first().unwrap().0, 0);
-        assert_eq!(e.last().unwrap().0 + e.last().unwrap().1, DEFAULT_MEMORY);
+        assert_eq!(e.last().unwrap().0 + e.last().unwrap().1, DEFAULT_RAM);
         for pair in e.windows(2) {
             assert_eq!(pair[0].0 + pair[0].1, pair[1].0);
         }
         assert!(e.iter().any(|x| x.0 == ACPI_BASE && x.2 == ACPI));
-        // A measured region Linux may use stays RAM and coalesces with the RAM around it.
         assert!(!e.iter().any(|x| x.0 == KERNEL_BASE));
     }
 
     #[test]
     fn accept_ranges_are_exactly_the_complement_of_the_placed_map() {
         let map = map();
-        let ranges = accept_ranges(&map, DEFAULT_MEMORY);
+        let ranges = accept_ranges(&map, DEFAULT_RAM);
         let placed: Vec<_> = map.iter().map(|p| (p.base, p.base + p.span())).collect();
         // Nothing placed is ever accepted: that is the page-aliasing attack.
         for (lo, hi) in &ranges {
@@ -354,17 +356,18 @@ mod tests {
         // ...and nothing else is left out.
         let covered: u64 = ranges.iter().map(|(l, h)| h - l).sum();
         let taken: u64 = placed.iter().map(|(l, h)| h - l).sum();
-        assert_eq!(covered + taken, DEFAULT_MEMORY);
+        assert_eq!(covered + taken, DEFAULT_RAM);
     }
 
     #[test]
-    fn a_declared_mmio_hole_is_reserved_and_never_accepted() {
+    fn a_declared_mmio_hole_is_absent_from_e820_and_never_accepted() {
         let mut map = map();
         map.push(Placed::mmio(0x30_0000, 0x2_0000));
-        assert!(e820(&map, DEFAULT_MEMORY)
+        // Linux assigns BARs out of gaps, so no entry of any type may cover the aperture.
+        assert!(e820(&map, DEFAULT_RAM)
             .iter()
-            .any(|x| x.0 == 0x30_0000 && x.1 == 0x2_0000 && x.2 == RESERVED));
-        assert!(accept_ranges(&map, DEFAULT_MEMORY)
+            .all(|x| x.0 + x.1 <= 0x30_0000 || x.0 >= 0x32_0000));
+        assert!(accept_ranges(&map, DEFAULT_RAM)
             .iter()
             .all(|(l, h)| *h <= 0x30_0000 || *l >= 0x32_0000));
     }
@@ -373,15 +376,14 @@ mod tests {
     fn overlapping_placement_is_rejected() {
         let mut map = map();
         map.push(Placed::mmio(ACPI_BASE, PAGE));
-        assert!(validate(&map, DEFAULT_MEMORY).is_err());
-        assert!(validate(&map[..1], DEFAULT_MEMORY).is_ok());
+        assert!(validate(&map, DEFAULT_RAM).is_err());
+        assert!(validate(&map[..1], DEFAULT_RAM).is_ok());
     }
 
     #[test]
     fn gdt_is_addressed_by_its_own_selectors() {
         let v = gdt_stack();
         assert_eq!(v.len(), BSP_STACK_SIZE as usize);
-        // A null descriptor at 0 and a 64-bit code descriptor at BOOT_CS.
         assert_eq!(&v[..8], &[0u8; 8]);
         assert_eq!(v[BOOT_CS as usize + 6] & 0x20, 0x20);
         let at = (GDT_PTR - BSP_STACK) as usize;

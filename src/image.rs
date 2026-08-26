@@ -61,7 +61,6 @@ struct Manifest {
 const RESET_SHIM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/reset.bin"));
 const _: () = assert!(RESET_SHIM.len() == SHIM_SIZE as usize);
 
-/// Everything both builds derive from the input files before they diverge.
 pub struct Prepared {
     pub info: boot::KernelInfo,
     pub setup: Vec<u8>,
@@ -116,12 +115,12 @@ pub fn prepare(
         kernel,
         initramfs,
         command,
-        entry: KERNEL_BASE + info.entry_offset,
+        entry: KERNEL_BASE + boot::ENTRY_64_OFFSET,
     })
 }
 
-/// The shim's data block: the kernel entry point, then zero-terminated (low, high) ranges.
-pub fn shim_data(shim: &mut [u8], entry: u64, ranges: &[(u64, u64)]) -> Result<(), String> {
+/// The shim, with the entry point and zero-terminated accept ranges packed in.
+pub fn shim(blob: &[u8], entry: u64, ranges: &[(u64, u64)]) -> Result<Vec<u8>, String> {
     let mut data = entry.to_le_bytes().to_vec();
     for (lo, hi) in ranges {
         data.extend_from_slice(&lo.to_le_bytes());
@@ -134,21 +133,37 @@ pub fn shim_data(shim: &mut [u8], entry: u64, ranges: &[(u64, u64)]) -> Result<(
             data.len()
         ));
     }
-    let at = SHIM_DATA as usize;
+    let (mut shim, at) = (blob.to_vec(), SHIM_DATA as usize);
     if shim[at..at + data.len()].iter().any(|b| *b != 0) {
         return Err("shim code overruns its data block".into());
     }
     shim[at..at + data.len()].copy_from_slice(&data);
-    Ok(())
+    Ok(shim)
 }
 
 /// The measured bytes this file authors, as opposed to the kernel and initramfs.
-pub fn shim_owned(placed: &[Placed]) -> usize {
+pub fn shim_owned(placed: &[Placed]) -> Result<usize, String> {
+    let owned: usize = placed
+        .iter()
+        .filter(|p| p.base < KERNEL_SETUP_BASE || p.base == RESET_ALIAS)
+        .filter(|p| !matches!(p.fill, Fill::Mmio(_)))
+        .map(|p| p.span() as usize)
+        .sum();
+    if owned > SHIM_LIMIT {
+        return Err(format!(
+            "shim-owned measured pages exceed {SHIM_LIMIT} bytes: {owned}"
+        ));
+    }
+    Ok(owned)
+}
+
+/// The named regions of the map, each hashed where the map places it.
+pub fn components(placed: &[Placed]) -> BTreeMap<&'static str, Component> {
     placed
         .iter()
-        .filter(|p| p.base < KERNEL_SETUP_BASE && !matches!(p.fill, Fill::Mmio(_)))
-        .map(|p| p.span() as usize)
-        .sum()
+        .filter(|p| !p.name.is_empty())
+        .map(|p| (p.name, component(p.base, p.data())))
+        .collect()
 }
 
 pub fn build(
@@ -162,39 +177,33 @@ pub fn build(
     let p = prepare(kernel_path, initramfs_path, params)?;
     let acpi = acpi::build(params.vcpus, true);
 
-    // The one authoritative map: E820, the file's pages and the accept list all derive from it.
+    // The one authoritative map: E820, the file's pages and the accept list follow from it.
     let mut placed = vec![
         // Blank: the zero page describes the map it belongs to, so its contents come last.
-        Placed::measured(ZERO_PAGE, RESERVED, vec![0u8; PAGE as usize]),
-        Placed::measured(CMDLINE, RESERVED, p.command.clone()),
-        Placed::measured(ACPI_BASE, ACPI, acpi.bytes.clone()),
-        Placed::measured(MAILBOX, RESERVED, vec![0u8; PAGE as usize]),
-        Placed::measured(PAGE_TABLES, RESERVED, identity_map(0)),
-        Placed::measured(BSP_STACK, RESERVED, boot::gdt_stack()),
-        Placed::measured(KERNEL_SETUP_BASE, RESERVED, p.setup.clone()),
-        Placed::measured(KERNEL_BASE, RAM, p.kernel.clone()),
-        Placed::measured(INITRAMFS_BASE, RAM, p.initramfs.clone()),
+        Placed::measured(ZERO_PAGE, "", RESERVED, vec![0u8; PAGE as usize]),
+        Placed::measured(CMDLINE, "command_line", RESERVED, p.command.clone()),
+        Placed::measured(ACPI_BASE, "acpi", ACPI, acpi.clone()),
+        Placed::measured(MAILBOX, "", RESERVED, vec![0u8; PAGE as usize]),
+        Placed::measured(PAGE_TABLES, "", RESERVED, identity_map(0)),
+        Placed::measured(BSP_STACK, "", RESERVED, boot::gdt_stack()),
+        Placed::measured(KERNEL_SETUP_BASE, "kernel_setup", RESERVED, p.setup.clone()),
+        Placed::measured(KERNEL_BASE, "kernel", RAM, p.kernel.clone()),
+        Placed::measured(INITRAMFS_BASE, "initramfs", RAM, p.initramfs.clone()),
         // The map covers the reset page, so the shim is never told to accept what it runs from.
-        Placed::measured(RESET_ALIAS, RESERVED, vec![0u8; PAGE as usize]),
+        Placed::measured(RESET_ALIAS, "shim", RESERVED, vec![0u8; PAGE as usize]),
     ];
     placed.extend(params.mmio.iter().map(|(b, n)| Placed::mmio(*b, *n)));
     boot::validate(&placed, params.memory)?;
     let e820 = boot::e820(&placed, params.memory);
-    let zero = boot::zero_page(&p.setup, p.info, p.initramfs.len(), acpi.rsdp, &e820)?;
+    let zero = boot::zero_page(&p.setup, p.info, p.initramfs.len(), ACPI_BASE, &e820, 0)?;
     boot::fill(&mut placed, ZERO_PAGE, zero)?;
-
-    let mut shim = RESET_SHIM.to_vec();
-    shim_data(
-        &mut shim,
-        p.entry,
-        &boot::accept_ranges(&placed, params.memory),
+    let accept = boot::accept_ranges(&placed, params.memory);
+    boot::fill(
+        &mut placed,
+        RESET_ALIAS,
+        shim(RESET_SHIM, p.entry, &accept)?,
     )?;
-    boot::fill(&mut placed, RESET_ALIAS, shim.clone())?;
-
-    let owned = shim_owned(&placed) + SHIM_SIZE as usize;
-    if owned > SHIM_LIMIT {
-        return Err(format!("shim-owned measured pages exceed 256 KiB: {owned}"));
-    }
+    let owned = shim_owned(&placed)?;
 
     // Ascending GPA order, which is the order a loader adds pages and MRTD is built in.
     placed.sort_by_key(|p| p.base);
@@ -207,13 +216,6 @@ pub fn build(
     let expected_mrtd = mrtd::calculate(&pages);
     fs::write(output, &file).map_err(io_error("write IGVM"))?;
 
-    let mut components = BTreeMap::new();
-    components.insert("kernel", component(KERNEL_BASE, &p.kernel));
-    components.insert("kernel_setup", component(KERNEL_SETUP_BASE, &p.setup));
-    components.insert("initramfs", component(INITRAMFS_BASE, &p.initramfs));
-    components.insert("command_line", component(CMDLINE, &p.command));
-    components.insert("acpi", component(ACPI_BASE, &acpi.bytes));
-    components.insert("shim", component(RESET_ALIAS, &shim));
     let manifest = Manifest {
         format_version: 1,
         memory_bytes: params.memory,
@@ -224,12 +226,11 @@ pub fn build(
         expected_mrtd: hex::encode(expected_mrtd),
         shim_owned_bytes: owned,
         attestation: tdx_attestation(&expected_mrtd, mrconfigid),
-        components,
+        components: components(&placed),
     };
     write_manifest(output, &manifest)
 }
 
-/// The declared apertures, published so a verifier reads them from the manifest.
 pub fn mmio_holes(params: &Params) -> Vec<String> {
     params
         .mmio
@@ -245,32 +246,34 @@ pub fn write_manifest<T: Serialize>(output: &Path, manifest: &T) -> Result<(), S
         .map_err(io_error("write manifest"))
 }
 
-/// The pages a loader hands the TDX module, each a whole 4-KiB page this file provides.
 fn launch_pages(placed: &[Placed]) -> Result<Vec<(u64, Vec<u8>)>, String> {
     let mut out = Vec::new();
     for region in placed {
         match &region.fill {
-            // Nothing is loaded at an MMIO aperture and no shim accepts it.
-            Fill::Mmio(_) => continue,
+            Fill::Measured(data) => out.extend(boot::pages(region.base, data)),
+            Fill::Mmio(_) => {}
             Fill::Host => {
                 return Err(format!(
                     "{:#x} is placed but has no measured contents",
                     region.base
                 ))
             }
-            Fill::Measured(data) => {
-                for (i, chunk) in data.chunks(PAGE as usize).enumerate() {
-                    let mut page = vec![0u8; PAGE as usize];
-                    page[..chunk.len()].copy_from_slice(chunk);
-                    out.push((region.base + i as u64 * PAGE, page));
-                }
-            }
         }
     }
     Ok(out)
 }
 
-/// The IGVM file: one measured page-data directive per page, under the TDX platform header.
+/// A page a loader imports at `gpa`: 4 KiB, private and measured, which is flags of zero.
+pub fn page_directive(gpa: u64, data_type: IgvmPageDataType, data: Vec<u8>) -> IgvmDirectiveHeader {
+    IgvmDirectiveHeader::PageData {
+        gpa,
+        compatibility_mask: COMPAT,
+        flags: IgvmPageDataFlags::new(),
+        data_type,
+        data,
+    }
+}
+
 fn igvm(pages: &[(u64, Vec<u8>)]) -> Result<Vec<u8>, String> {
     let platform = IgvmPlatformHeader::SupportedPlatform(IGVM_VHS_SUPPORTED_PLATFORM {
         compatibility_mask: COMPAT,
@@ -282,13 +285,7 @@ fn igvm(pages: &[(u64, Vec<u8>)]) -> Result<Vec<u8>, String> {
     });
     let directives = pages
         .iter()
-        .map(|(gpa, data)| IgvmDirectiveHeader::PageData {
-            gpa: *gpa,
-            compatibility_mask: COMPAT,
-            flags: IgvmPageDataFlags::new(),
-            data_type: IgvmPageDataType::NORMAL,
-            data: data.clone(),
-        })
+        .map(|(gpa, data)| page_directive(*gpa, IgvmPageDataType::NORMAL, data.clone()))
         .collect();
     let file = IgvmFile::new(IgvmRevision::V1, vec![platform], vec![], directives)
         .map_err(|e| format!("construct TDX IGVM: {e}"))?;
@@ -381,7 +378,7 @@ pub mod tests {
     use tempfile::tempdir;
 
     pub fn params() -> Params {
-        Params::new(DEFAULT_MEMORY, DEFAULT_VCPUS, None, DEFAULT_CBIT, vec![]).unwrap()
+        Params::tdx(DEFAULT_RAM, DEFAULT_VCPUS, "", vec![]).unwrap()
     }
 
     /// A bzImage-shaped stub: enough of the setup header for the builder to accept it.
@@ -415,9 +412,7 @@ pub mod tests {
         );
         assert_eq!(pdpte(&p, 0), 0x83);
         assert_eq!(pdpte(&p, MAP_LIMIT - GIB), (MAP_LIMIT - GIB) | 0x83);
-        // The TDX shim executes at RESET_ALIAS on this map.
         assert_eq!(pdpte(&p, RESET_ALIAS) & 1, 1);
-        // The encrypted map is the same table with one bit set in every entry.
         let e = identity_map(DEFAULT_CBIT as u64);
         for at in (0..PAGE_TABLE_SIZE as usize).step_by(8) {
             let (plain, enc) = (
@@ -438,15 +433,20 @@ pub mod tests {
     /// The SNP shim PVALIDATEs and zeroes through the map, so every range it walks is mapped.
     #[test]
     fn every_range_the_shim_is_told_to_touch_is_mapped() {
-        for memory in [DEFAULT_MEMORY, 16 * GIB, MAP_LIMIT] {
-            let params = Params::new(memory, 1, None, DEFAULT_CBIT, vec![]).unwrap();
+        for ram in [DEFAULT_RAM, 16 * GIB, MAX_RAM] {
+            let params = Params::snp(ram, DEFAULT_CBIT, "", vec![]).unwrap();
             let map = identity_map(params.cbit as u64);
-            let placed = vec![Placed::measured(KERNEL_BASE, RAM, vec![0u8; PAGE as usize])];
+            let placed = vec![Placed::measured(
+                KERNEL_BASE,
+                "",
+                RAM,
+                vec![0u8; PAGE as usize],
+            )];
             for (_, hi) in boot::accept_ranges(&placed, params.memory) {
                 assert_eq!(pdpte(&map, hi - PAGE) & 1, 1, "{hi:#x} is unmapped");
             }
         }
-        assert!(Params::new(MAP_LIMIT + PAGE, 1, None, DEFAULT_CBIT, vec![]).is_err());
+        assert!(Params::snp(MAX_RAM + PAGE, DEFAULT_CBIT, "", vec![]).is_err());
     }
 
     #[test]
@@ -463,16 +463,33 @@ pub mod tests {
     #[test]
     fn required_cmdline_is_appended_whatever_the_operator_asks_for() {
         assert_eq!(params().cmdline, "panic=-1 no5lvl");
-        let p = Params::new(DEFAULT_MEMORY, 1, Some("quiet"), DEFAULT_CBIT, vec![]).unwrap();
+        let p = Params::tdx(DEFAULT_RAM, 1, "quiet", vec![]).unwrap();
         assert_eq!(p.cmdline, "quiet no5lvl");
-        let p = Params::new(DEFAULT_MEMORY, 1, Some("no5lvl x"), DEFAULT_CBIT, vec![]).unwrap();
+        let p = Params::tdx(DEFAULT_RAM, 1, "no5lvl x", vec![]).unwrap();
         assert_eq!(p.cmdline, "no5lvl x");
-        assert!(Params::new(DEFAULT_MEMORY, 0, None, DEFAULT_CBIT, vec![]).is_err());
-        assert!(Params::new(0x1000, 1, None, DEFAULT_CBIT, vec![]).is_err());
-        assert!(Params::new(DEFAULT_MEMORY, MAX_VCPUS + 1, None, DEFAULT_CBIT, vec![]).is_err());
+        assert!(Params::tdx(DEFAULT_RAM, 0, "", vec![]).is_err());
+        assert!(Params::tdx(0x1000, 1, "", vec![]).is_err());
+        assert!(Params::tdx(DEFAULT_RAM, MAX_VCPUS + 1, "", vec![]).is_err());
     }
 
-    /// The reset page as a loader finds it: the last and highest page the file carries.
+    /// Builds from stub inputs and returns the IGVM file and the manifest beside it.
+    pub fn built(params: &Params) -> (Vec<u8>, serde_json::Value) {
+        let dir = tempdir().unwrap();
+        let (kernel, initramfs, out) = (
+            dir.path().join("bzImage"),
+            dir.path().join("initrd"),
+            dir.path().join("out.igvm"),
+        );
+        fs::write(&kernel, test_kernel()).unwrap();
+        fs::write(&initramfs, vec![7u8; 100_000]).unwrap();
+        build(&kernel, &initramfs, &out, params, None).unwrap();
+        let manifest = fs::read(format!("{}.manifest.json", out.display())).unwrap();
+        (
+            fs::read(out).unwrap(),
+            serde_json::from_slice(&manifest).unwrap(),
+        )
+    }
+
     fn reset_page(file: &[u8]) -> Vec<u8> {
         let (gpa, page) = igvm_pages(file).unwrap().pop().unwrap();
         assert_eq!(gpa, RESET_ALIAS);
@@ -481,17 +498,8 @@ pub mod tests {
 
     #[test]
     fn builds_a_byte_identical_loadable_igvm_file() {
-        let dir = tempdir().unwrap();
-        let kernel_path = dir.path().join("bzImage");
-        let initramfs_path = dir.path().join("initrd");
-        let a = dir.path().join("a.igvm");
-        let b = dir.path().join("b.igvm");
-        fs::write(&kernel_path, test_kernel()).unwrap();
-        fs::write(&initramfs_path, b"test initramfs").unwrap();
-        build(&kernel_path, &initramfs_path, &a, &params(), None).unwrap();
-        build(&kernel_path, &initramfs_path, &b, &params(), None).unwrap();
-        let one = fs::read(a).unwrap();
-        assert_eq!(one, fs::read(b).unwrap());
+        let one = built(&params()).0;
+        assert_eq!(one, built(&params()).0);
         // Read back the way a loader does: whole measured pages in ascending order.
         let pages = igvm_pages(&one).unwrap();
         assert!(pages.windows(2).all(|w| w[0].0 + PAGE <= w[1].0));
@@ -499,7 +507,6 @@ pub mod tests {
         assert_eq!(reset_page(&one)[PAGE as usize - 16], 0xe9);
     }
 
-    /// Reads the ranges out of the packed reset page the way each shim does.
     pub fn shim_ranges(page: &[u8]) -> (u64, Vec<(u64, u64)>) {
         let at = SHIM_DATA as usize;
         let word = |i: usize| u64::from_le_bytes(page[i..i + 8].try_into().unwrap());
@@ -514,15 +521,8 @@ pub mod tests {
 
     #[test]
     fn the_shim_accepts_exactly_what_the_builder_did_not_place() {
-        let dir = tempdir().unwrap();
-        let kernel_path = dir.path().join("bzImage");
-        let initramfs_path = dir.path().join("initrd");
-        let out = dir.path().join("a.igvm");
-        fs::write(&kernel_path, test_kernel()).unwrap();
-        fs::write(&initramfs_path, vec![0u8; 100_000]).unwrap();
         let params = params();
-        build(&kernel_path, &initramfs_path, &out, &params, None).unwrap();
-        let file = fs::read(&out).unwrap();
+        let file = built(&params).0;
         let (entry, ranges) = shim_ranges(&reset_page(&file));
         assert_eq!(entry, KERNEL_BASE + 0x200);
 
@@ -551,21 +551,8 @@ pub mod tests {
     /// Each component is SHA-256 of exactly `size` bytes at `address`, reset page included.
     #[test]
     fn every_component_hashes_the_bytes_at_the_address_it_names() {
-        let dir = tempdir().unwrap();
-        let kernel_path = dir.path().join("bzImage");
-        let initramfs_path = dir.path().join("initrd");
-        let out = dir.path().join("a.igvm");
-        fs::write(&kernel_path, test_kernel()).unwrap();
-        fs::write(&initramfs_path, vec![7u8; 100_000]).unwrap();
-        build(&kernel_path, &initramfs_path, &out, &params(), None).unwrap();
-        let loaded: BTreeMap<u64, Vec<u8>> = igvm_pages(&fs::read(&out).unwrap())
-            .unwrap()
-            .into_iter()
-            .collect();
-        let manifest: serde_json::Value =
-            serde_json::from_slice(&fs::read(format!("{}.manifest.json", out.display())).unwrap())
-                .unwrap();
-
+        let (file, manifest) = built(&params());
+        let loaded: BTreeMap<u64, Vec<u8>> = igvm_pages(&file).unwrap().into_iter().collect();
         let components = manifest["components"].as_object().unwrap();
         assert_eq!(components.len(), 6);
         for (name, c) in components {
@@ -573,7 +560,6 @@ pub mod tests {
                 u64::from_str_radix(c["address"].as_str().unwrap().trim_start_matches("0x"), 16)
                     .unwrap();
             let size = c["size"].as_u64().unwrap() as usize;
-            // The pages the file loads from that address onwards, in order.
             let mut bytes = Vec::new();
             while bytes.len() < size {
                 bytes.extend_from_slice(&loaded[&(gpa + bytes.len() as u64)]);
@@ -588,64 +574,70 @@ pub mod tests {
 
     #[test]
     fn a_declared_mmio_hole_reaches_the_image_and_the_shim() {
-        let dir = tempdir().unwrap();
-        let kernel_path = dir.path().join("bzImage");
-        let initramfs_path = dir.path().join("initrd");
-        fs::write(&kernel_path, test_kernel()).unwrap();
-        fs::write(&initramfs_path, b"test initramfs").unwrap();
         let hole = (0x000a_0000, 0x0002_0000);
-        let with = Params::new(
-            DEFAULT_MEMORY,
-            DEFAULT_VCPUS,
-            None,
-            DEFAULT_CBIT,
-            vec![hole],
-        )
-        .unwrap();
-        let a = dir.path().join("a.igvm");
-        let b = dir.path().join("b.igvm");
-        build(&kernel_path, &initramfs_path, &a, &params(), None).unwrap();
-        build(&kernel_path, &initramfs_path, &b, &with, None).unwrap();
+        let with = Params::tdx(DEFAULT_RAM, DEFAULT_VCPUS, "", vec![hole]).unwrap();
+        let (plain, held) = (built(&params()).0, built(&with).0);
         // Declaring a hole is a measured change: it moves E820 and the accept list.
-        assert_ne!(fs::read(&a).unwrap(), fs::read(&b).unwrap());
+        assert_ne!(plain, held);
         assert_eq!(mmio_holes(&with), vec!["0x000a0000:0x20000".to_string()]);
 
-        // Undeclared, the aperture is ordinary RAM and the shim accepts it.
-        let plain = fs::read(&a).unwrap();
         let (_, ranges) = shim_ranges(&reset_page(&plain));
         assert!(ranges
             .iter()
             .any(|(l, h)| *l <= hole.0 && *h >= hole.0 + hole.1));
-        // Declared, it is reserved and the shim skips it.
-        let held = fs::read(&b).unwrap();
         let (_, ranges) = shim_ranges(&reset_page(&held));
         assert!(ranges
             .iter()
             .all(|(l, h)| *h <= hole.0 || *l >= hole.0 + hole.1));
     }
 
-    /// Past 4 GiB of `--memory` the reset page lies inside the guest's own address space.
+    /// A map that misses the machine QEMU builds leaves no window to assign BARs out of.
+    #[test]
+    fn the_pci_aperture_follows_the_ram_the_machine_has() {
+        let small = Params::tdx(2 * GIB, 1, "", vec![]).unwrap();
+        assert_eq!((small.memory, small.mmio.len()), (2 * GIB, 0));
+        assert_eq!(Params::tdx(3 * GIB, 1, "", vec![]).unwrap().memory, 5 * GIB);
+        let p = Params::tdx(8 * GIB, 1, "", vec![]).unwrap();
+        assert_eq!(p.memory, 10 * GIB);
+        // TDX loads the reset page inside the aperture; SNP loads nothing there.
+        assert_eq!(p.mmio, vec![(2 * GIB, RESET_ALIAS - 2 * GIB)]);
+        let snp = Params::snp(8 * GIB, DEFAULT_CBIT, "", vec![]).unwrap();
+        assert_eq!(snp.mmio, vec![(2 * GIB, 2 * GIB)]);
+
+        let placed: Vec<Placed> = p
+            .mmio
+            .iter()
+            .map(|(base, size)| Placed::mmio(*base, *size))
+            .chain([Placed::measured(
+                RESET_ALIAS,
+                "",
+                RESERVED,
+                vec![0u8; PAGE as usize],
+            )])
+            .collect();
+        let e820 = boot::e820(&placed, p.memory);
+        assert!(e820
+            .iter()
+            .all(|(base, size, kind)| *kind != RAM || base + size <= 2 * GIB || *base >= 4 * GIB));
+        assert!(e820
+            .iter()
+            .any(|(base, size, kind)| (*base, *size, *kind) == (4 * GIB, 6 * GIB, RAM)));
+    }
+
+    /// Past 4 GiB of map the reset page lies inside the guest's own address space.
     #[test]
     fn a_large_guest_leaves_the_reset_page_out_of_its_ram() {
-        let dir = tempdir().unwrap();
-        let kernel_path = dir.path().join("bzImage");
-        let initramfs_path = dir.path().join("initrd");
-        let out = dir.path().join("a.igvm");
-        fs::write(&kernel_path, test_kernel()).unwrap();
-        fs::write(&initramfs_path, b"test initramfs").unwrap();
-        let params = Params::new(8 * GIB, DEFAULT_VCPUS, None, DEFAULT_CBIT, vec![]).unwrap();
-        build(&kernel_path, &initramfs_path, &out, &params, None).unwrap();
-        let file = fs::read(&out).unwrap();
-        let (_, ranges) = shim_ranges(&reset_page(&file));
+        let params = Params::tdx(8 * GIB, DEFAULT_VCPUS, "", vec![]).unwrap();
+        let (_, ranges) = shim_ranges(&reset_page(&built(&params).0));
         assert!(ranges
             .iter()
             .all(|(lo, hi)| *hi <= RESET_ALIAS || *lo >= RESET_ALIAS + PAGE));
-        // ...and the RAM above it is still accepted, so the gap is that page alone.
         assert_eq!(ranges.last().unwrap(), &(RESET_ALIAS + PAGE, params.memory));
         // The same placement reserves it in E820, so Linux does not take it for free RAM.
         let e820 = boot::e820(
             &[Placed::measured(
                 RESET_ALIAS,
+                "",
                 RESERVED,
                 vec![0u8; PAGE as usize],
             )],
@@ -671,9 +663,7 @@ pub mod tests {
         assert_eq!(want & ATTR_SEPT_VE_DISABLE, ATTR_SEPT_VE_DISABLE);
         // A masked compare: nothing is demanded outside the mask.
         assert_eq!(want & !mask, 0);
-        // The other half of requiring MIGRATABLE clear: no service TD is bound.
         assert_eq!(r["servtd_hash"], Some(zeros(48)));
-        // The module version is the host's, so the operator pins it.
         assert_eq!(r["tee_tcb_svn"], None);
     }
 }

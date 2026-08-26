@@ -5,7 +5,7 @@ mod layout;
 mod mrtd;
 mod snp;
 use clap::{Args, Parser, Subcommand};
-use layout::{Params, DEFAULT_CBIT, DEFAULT_MEMORY, DEFAULT_VCPUS};
+use layout::{Params, DEFAULT_CBIT, DEFAULT_RAM, DEFAULT_VCPUS};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -27,13 +27,13 @@ struct Common {
     initramfs: PathBuf,
     #[arg(long)]
     output: PathBuf,
-    /// Top of the guest-physical map, in 0x hex or with a K/M/G suffix.
-    #[arg(long, default_value_t = DEFAULT_MEMORY, value_parser = parse_size)]
-    memory: u64,
+    /// Guest RAM the host must match, in 0x hex or with a K/M/G suffix.
+    #[arg(long, default_value_t = DEFAULT_RAM, value_parser = parse_size)]
+    ram: u64,
     /// Linux command line, measured whole, with `no5lvl` always appended.
-    #[arg(long)]
-    cmdline: Option<String>,
-    /// A reserved physical range, as BASE:SIZE, repeatable.
+    #[arg(long, default_value = "", hide_default_value = true)]
+    cmdline: String,
+    /// A further MMIO aperture besides the machine's own, as BASE:SIZE, repeatable.
     #[arg(long, value_name = "BASE:SIZE", value_parser = parse_hole)]
     mmio_hole: Vec<(u64, u64)>,
 }
@@ -92,20 +92,14 @@ fn parse_hole(text: &str) -> Result<(u64, u64), String> {
     Ok((parse_size(base)?, parse_size(size)?))
 }
 
-fn main() {
-    let result = match Cli::parse().command {
+fn run() -> Result<(), String> {
+    match Cli::parse().command {
         Command::Build {
             common,
             vcpus,
             config_hash,
-        } => Params::new(
-            common.memory,
-            vcpus,
-            common.cmdline.as_deref(),
-            DEFAULT_CBIT,
-            common.mmio_hole,
-        )
-        .and_then(|params| {
+        } => {
+            let params = Params::tdx(common.ram, vcpus, &common.cmdline, common.mmio_hole)?;
             image::build(
                 &common.kernel,
                 &common.initramfs,
@@ -113,21 +107,15 @@ fn main() {
                 &params,
                 config_hash.as_deref(),
             )
-        }),
+        }
         Command::BuildSnp {
             common,
             config_hash,
             cbit,
             id_key,
             guest_svn,
-        } => Params::new(
-            common.memory,
-            layout::SNP_VCPU_COUNT,
-            common.cmdline.as_deref(),
-            cbit,
-            common.mmio_hole,
-        )
-        .and_then(|params| {
+        } => {
+            let params = Params::snp(common.ram, cbit, &common.cmdline, common.mmio_hole)?;
             snp::build(
                 &common.kernel,
                 &common.initramfs,
@@ -137,9 +125,12 @@ fn main() {
                 id_key.as_deref(),
                 guest_svn,
             )
-        }),
-    };
-    if let Err(error) = result {
+        }
+    }
+}
+
+fn main() {
+    if let Err(error) = run() {
         eprintln!("error: {error}");
         std::process::exit(2);
     }

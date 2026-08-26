@@ -3,11 +3,6 @@ use crate::{
     layout::*,
 };
 
-pub struct AcpiTables {
-    pub bytes: Vec<u8>,
-    pub rsdp: u64,
-}
-
 const OEM_ID: &[u8; 6] = b"TINFOI";
 const OEM_TABLE_ID: &[u8; 8] = b"TDXSHIM ";
 const CREATOR_ID: &[u8; 4] = b"TFNL";
@@ -37,9 +32,8 @@ const MADT_WAKEUP: u8 = 16;
 const LAPIC_ENABLED: u32 = 1;
 const LOCAL_APIC_ADDR: u32 = 0xfee0_0000;
 
-/// The tables are one measured page, at the offsets layout.rs pins and checks.
-pub fn build(cpus: u32, wakeup: bool) -> AcpiTables {
-    let rsdp = ACPI_BASE;
+/// One measured page: the RSDP at ACPI_BASE, the rest at the offsets layout.rs checks.
+pub fn build(cpus: u32, wakeup: bool) -> Vec<u8> {
     let xsdt = ACPI_BASE + ACPI_XSDT;
     let fadt = ACPI_BASE + ACPI_FADT;
     let dsdt = ACPI_BASE + ACPI_DSDT;
@@ -97,7 +91,7 @@ pub fn build(cpus: u32, wakeup: bool) -> AcpiTables {
         put64(&mut bytes, at + 8, MAILBOX);
     }
     finish(&mut bytes[mo..mo + madt_len]);
-    AcpiTables { bytes, rsdp }
+    bytes
 }
 
 fn madt_len(cpus: u32, wakeup: bool) -> u64 {
@@ -129,29 +123,24 @@ mod tests {
     fn tables_have_valid_checksums_and_wakeup() {
         let a = build(DEFAULT_VCPUS, true);
         assert_eq!(
-            a.bytes[0..RSDP_LEN as usize]
+            a[0..RSDP_LEN as usize]
                 .iter()
                 .fold(0u8, |x, y| x.wrapping_add(*y)),
             0
         );
         let mo = ACPI_MADT as usize;
-        let len = u32::from_le_bytes(a.bytes[mo + 4..mo + 8].try_into().unwrap()) as usize;
+        let len = u32::from_le_bytes(a[mo + 4..mo + 8].try_into().unwrap()) as usize;
         assert_eq!(
-            a.bytes[mo..mo + len]
-                .iter()
-                .fold(0u8, |x, y| x.wrapping_add(*y)),
+            a[mo..mo + len].iter().fold(0u8, |x, y| x.wrapping_add(*y)),
             0
         );
-        assert_eq!(
-            a.bytes[mo + madt_len(DEFAULT_VCPUS, false) as usize],
-            MADT_WAKEUP
-        );
+        assert_eq!(a[mo + madt_len(DEFAULT_VCPUS, false) as usize], MADT_WAKEUP);
     }
     #[test]
     fn snp_madt_advertises_only_the_provisioned_cpu() {
         let a = build(SNP_VCPU_COUNT, false);
         let at = ACPI_MADT as usize + 4;
-        let len = u32::from_le_bytes(a.bytes[at..at + 4].try_into().unwrap()) as u64;
+        let len = u32::from_le_bytes(a[at..at + 4].try_into().unwrap()) as u64;
         assert_eq!(len, madt_len(SNP_VCPU_COUNT, false));
         // Linux starts an application processor only through the wakeup structure.
         assert_eq!(SNP_VCPU_COUNT, 1);
@@ -160,7 +149,7 @@ mod tests {
     fn the_largest_allowed_madt_still_fits_its_measured_page() {
         let a = build(MAX_VCPUS, true);
         let at = ACPI_MADT as usize;
-        let len = u32::from_le_bytes(a.bytes[at + 4..at + 8].try_into().unwrap()) as usize;
+        let len = u32::from_le_bytes(a[at + 4..at + 8].try_into().unwrap()) as usize;
         assert!(at + len <= PAGE as usize);
     }
 }

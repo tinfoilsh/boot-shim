@@ -1,10 +1,8 @@
 // The fixed guest-physical layout, measured whole and shared with the reset shims.
 
-// The macro defines each address once and collects the table build.rs re-emits.
 macro_rules! layout {
     ($($(#[$attr:meta])* $name:ident = $value:expr;)*) => {
         $($(#[$attr])* pub const $name: u64 = $value;)*
-        // Read by build.rs; the crate itself uses only the constants.
         #[allow(dead_code)]
         pub const SYMBOLS: &[(&str, u64)] = &[$((stringify!($name), $name)),*];
     };
@@ -58,7 +56,13 @@ pub const SHIM_LIMIT: usize = 256 * 1024;
 // The two page-table pages reach this far; past it a shim faults with no IDT installed.
 pub const GIB: u64 = 0x4000_0000;
 pub const MAP_LIMIT: u64 = 512 * GIB;
-const _: () = assert!(PAGE_TABLE_SIZE == 2 * PAGE);
+const FOUR_GIB: u64 = 4 * GIB;
+
+// q35 splits a guest this size or larger, opening a PCI aperture (hw/i386/pc_q35.c).
+const Q35_SPLIT: u64 = 0xb000_0000;
+const Q35_LOWMEM: u64 = 2 * GIB;
+// A split guest's map reaches 4 GiB plus the RAM that did not fit below the aperture.
+pub const MAX_RAM: u64 = MAP_LIMIT - FOUR_GIB + Q35_LOWMEM;
 const _: () = assert!(RESET_ALIAS < MAP_LIMIT);
 
 // A shim accepts the gaps between these regions, so they tile in the order it skips them.
@@ -75,7 +79,6 @@ const _: () = assert!(SHIM_DATA + SHIM_DATA_SIZE <= SHIM_SIZE);
 // A TD fetches its first instruction from the top of the 32-bit address space.
 const _: () = assert!(RESET_ALIAS + PAGE == 0x1_0000_0000);
 
-// The four tables are laid out by hand inside one page, so the asserts check the fit.
 pub const ACPI_XSDT: u64 = 0x100;
 pub const ACPI_FADT: u64 = 0x200;
 pub const ACPI_DSDT: u64 = 0x400;
@@ -109,8 +112,7 @@ const POLICY_RESERVED_ONE: u64 = 1 << 17;
 pub const SNP_GUEST_POLICY: u64 =
     POLICY_ABI_MINOR | POLICY_ABI_MAJOR | POLICY_SMT | POLICY_RESERVED_ONE;
 
-// Defaults for the measured build inputs below, each one overridable.
-pub const DEFAULT_MEMORY: u64 = 0x4000_0000;
+pub const DEFAULT_RAM: u64 = 0x4000_0000;
 pub const DEFAULT_VCPUS: u32 = 4;
 pub const DEFAULT_CMDLINE: &str = "panic=-1";
 // The encrypted identity map is built around this bit; no code before Linux discovers it.
@@ -119,28 +121,39 @@ pub const DEFAULT_CBIT: u8 = 51;
 // The measured page tables are four-level, so this is appended to every command line.
 const REQUIRED_CMDLINE: &str = "no5lvl";
 
-/// The build inputs, all of them measured and none a property of the machine.
 pub struct Params {
+    /// Top of the guest-physical map: low RAM, the PCI aperture and high RAM.
     pub memory: u64,
     pub vcpus: u32,
     pub cmdline: String,
     pub cbit: u8,
-    /// Declared MMIO apertures: E820 reserves them and no shim accepts them.
+    /// Absent from E820 so Linux assigns BARs out of them, and accepted by no shim.
     pub mmio: Vec<(u64, u64)>,
 }
 
 impl Params {
-    pub fn new(
-        memory: u64,
+    /// The TDX shim runs from the reset page, so the aperture stops short of it.
+    pub fn tdx(ram: u64, vcpus: u32, cmdline: &str, mmio: Vec<(u64, u64)>) -> Result<Self, String> {
+        Self::new(ram, vcpus, cmdline, DEFAULT_CBIT, mmio, RESET_ALIAS)
+    }
+
+    /// The SNP map, which places nothing inside the aperture, so it runs to 4 GiB.
+    pub fn snp(ram: u64, cbit: u8, cmdline: &str, mmio: Vec<(u64, u64)>) -> Result<Self, String> {
+        Self::new(ram, SNP_VCPU_COUNT, cmdline, cbit, mmio, FOUR_GIB)
+    }
+
+    fn new(
+        ram: u64,
         vcpus: u32,
-        cmdline: Option<&str>,
+        cmdline: &str,
         cbit: u8,
         mmio: Vec<(u64, u64)>,
+        hole_end: u64,
     ) -> Result<Self, String> {
-        if !memory.is_multiple_of(PAGE) || memory <= INITRAMFS_BASE || memory > MAP_LIMIT {
+        if !ram.is_multiple_of(PAGE) || ram <= INITRAMFS_BASE || ram > MAX_RAM {
             return Err(format!(
-                "--memory must be page-aligned, larger than {INITRAMFS_BASE:#x} \
-                 and at most {MAP_LIMIT:#x}"
+                "--ram must be page-aligned, larger than {INITRAMFS_BASE:#x} \
+                 and at most {MAX_RAM:#x}"
             ));
         }
         if vcpus == 0 || vcpus > MAX_VCPUS {
@@ -149,14 +162,26 @@ impl Params {
         if !(32..=63).contains(&cbit) {
             return Err("--cbit must name a bit in the physical address width".into());
         }
-        let cmdline = match cmdline.map(str::trim).filter(|c| !c.is_empty()) {
-            None => format!("{DEFAULT_CMDLINE} {REQUIRED_CMDLINE}"),
-            Some(c) if c.split_whitespace().any(|w| w == REQUIRED_CMDLINE) => c.to_string(),
-            Some(c) => format!("{c} {REQUIRED_CMDLINE}"),
+        let cmdline = match cmdline.trim() {
+            "" => format!("{DEFAULT_CMDLINE} {REQUIRED_CMDLINE}"),
+            c if c.split_whitespace().any(|w| w == REQUIRED_CMDLINE) => c.to_string(),
+            c => format!("{c} {REQUIRED_CMDLINE}"),
         };
         if cmdline.bytes().any(|b| b == 0 || !b.is_ascii()) {
             return Err("--cmdline must be printable ASCII".into());
         }
+        // A split guest restacks above 4 GiB, so the map reaches past the RAM it has.
+        let split = ram >= Q35_SPLIT;
+        let memory = if split {
+            FOUR_GIB + ram - Q35_LOWMEM
+        } else {
+            ram
+        };
+        let mmio: Vec<(u64, u64)> = split
+            .then_some((Q35_LOWMEM, hole_end - Q35_LOWMEM))
+            .into_iter()
+            .chain(mmio)
+            .collect();
         for (base, size) in &mmio {
             if !base.is_multiple_of(PAGE) || !size.is_multiple_of(PAGE) || *size == 0 {
                 return Err("--mmio-hole must be a non-empty page-aligned range".into());
