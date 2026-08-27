@@ -41,7 +41,7 @@ struct Common {
 #[derive(Subcommand)]
 enum Command {
     /// Build an Intel TDX image.
-    Build {
+    BuildTdx {
         #[command(flatten)]
         common: Common,
         /// Processor count, which the measured MADT advertises.
@@ -95,7 +95,7 @@ fn parse_hole(text: &str) -> Result<(u64, u64), String> {
 
 fn run() -> Result<(), String> {
     match Cli::parse().command {
-        Command::Build {
+        Command::BuildTdx {
             common,
             vcpus,
             config_hash,

@@ -34,7 +34,7 @@ The host needs Rust, GNU `as`, and GNU `objcopy`.
 TDX:
 
 ```sh
-cargo run --release -- build \
+cargo run --release -- build-tdx \
   --kernel /path/to/bzImage \
   --initramfs /path/to/initramfs \
   --output image.igvm
