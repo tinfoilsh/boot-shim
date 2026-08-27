@@ -168,6 +168,33 @@ SEV-SNP:
 | `author_key_digest` | zero | This image uses no author key |
 | `reported_tcb` | operator | The platform TCB is the host's |
 
+## Reproducible build
+
+`cargo build` pins rustc through `rust-toolchain`, and nothing else. rustc
+hands the final link to `cc`, so the binary still depends on the host's gcc,
+ld and glibc: two machines running the same pinned rustc 1.88.0 produced
+different binaries from identical source, differing only in gcc 15.2 against
+13.3, binutils 2.46 against 2.42, and glibc 2.43 against 2.39.
+
+`default.nix` pins all of them, at the nixpkgs revision cvmimage builds
+against:
+
+```sh
+nix-build              # -> result/bin/boot-shim
+nix-build --check      # rebuild and fail if the output moved
+```
+
+The pin covers GNU `as` and `objcopy` deliberately: `build.rs` assembles the
+reset shims with them, and those bytes land in the measured shim page, so the
+assembler is part of the measurement.
+
+Worth separating the two properties. The image is already reproducible without
+any of this -- three machines with different native toolchains emit the same
+IGVM bytes and the same MRTD, because the image is data this crate lays out
+rather than anything the compiler chooses. What nix adds is a reproducible
+*builder*, so that anyone asked to trust an `expected_mrtd` can rebuild the
+thing that computed it.
+
 ## Test
 
 ```sh
