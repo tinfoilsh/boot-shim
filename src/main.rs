@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(
-    name = "tdx-shim",
+    name = "boot-shim",
     about = "Build deterministic TDX or AMD SEV-SNP Linux IGVM images"
 )]
 struct Cli {
@@ -40,6 +40,7 @@ struct Common {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Build an Intel TDX image.
     Build {
         #[command(flatten)]
         common: Common,
