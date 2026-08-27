@@ -77,7 +77,17 @@ qemu-system-x86_64 -accel kvm -m 1G -smp 4 -cpu host \
 
 Do not pass `-bios`, `-kernel`, `-initrd`, or `-append`. Add `console=ttyS0` to `--cmdline` for a serial console.
 
-Upstream QEMU does not yet support TDX IGVM files. Apply the patch in [`qemu-patches/`](qemu-patches) and build QEMU with `--enable-igvm` against libigvm 0.3 or newer.
+Upstream QEMU supports IGVM for SEV, SEV-ES and SEV-SNP, but not TDX. Apply the
+patch in [`qemu-patches/`](qemu-patches) and build QEMU with `--enable-igvm`
+against libigvm 0.3 or newer:
+
+```sh
+cd qemu-10.1.0
+git am /path/to/boot-shim/qemu-patches/qemu-10.1.0-0001-igvm-tdx.patch
+```
+
+The patch is named for the release it applies to and carries that release's
+tarball sha256 in its message.
 
 ## SEV-SNP policy
 
