@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(
-    name = "tdx-shim",
+    name = "boot-shim",
     about = "Build deterministic TDX or AMD SEV-SNP Linux IGVM images"
 )]
 struct Cli {
@@ -40,7 +40,8 @@ struct Common {
 
 #[derive(Subcommand)]
 enum Command {
-    Build {
+    /// Build an Intel TDX image.
+    BuildTdx {
         #[command(flatten)]
         common: Common,
         /// Processor count, which the measured MADT advertises.
@@ -94,7 +95,7 @@ fn parse_hole(text: &str) -> Result<(u64, u64), String> {
 
 fn run() -> Result<(), String> {
     match Cli::parse().command {
-        Command::Build {
+        Command::BuildTdx {
             common,
             vcpus,
             config_hash,

@@ -46,6 +46,10 @@ pub fn config_field(hash: Option<&str>, bytes: usize) -> Result<String, String> 
 #[derive(Serialize)]
 struct Manifest {
     format_version: u32,
+    /// Which platform's launch digest this manifest carries. A TDX image and
+    /// an SNP image are not interchangeable and their measurements mean
+    /// different things, so a reader should never have to infer it.
+    platform: &'static str,
     memory_bytes: u64,
     vcpus: u32,
     command_line: String,
@@ -218,6 +222,7 @@ pub fn build(
 
     let manifest = Manifest {
         format_version: 1,
+        platform: "tdx",
         memory_bytes: params.memory,
         vcpus: params.vcpus,
         command_line: params.cmdline.clone(),
@@ -592,6 +597,16 @@ pub mod tests {
     }
 
     /// A map that misses the machine QEMU builds leaves no window to assign BARs out of.
+    /// Both manifests name their platform. A reader holding one of these has
+    /// to know whether expected_mrtd or expected_snp_measurement is the
+    /// number that matters, and should not have to guess from a filename.
+    #[test]
+    fn a_manifest_names_the_platform_it_measured() {
+        let (_, manifest) = built(&params());
+        assert_eq!(manifest["platform"], "tdx");
+        assert!(manifest["expected_mrtd"].is_string());
+    }
+
     #[test]
     fn the_pci_aperture_follows_the_ram_the_machine_has() {
         let small = Params::tdx(2 * GIB, 1, "", vec![]).unwrap();
