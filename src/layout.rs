@@ -43,6 +43,11 @@ layout! {
     // The 10-byte pseudo-descriptor follows the GDT, so a shim `lgdt`s without a stack.
     GDT_PTR = BSP_STACK + GDT_LIMIT + 1;
 
+    // An SNP application processor launches from its own measured VMSA and parks
+    // here until Linux recreates it through the GHCB AP-creation call.
+    SHIM_AP_PARK = 0x0000_0b00;
+    SNP_AP_ENTRY = SHIM_BASE + SHIM_AP_PARK;
+
     // Where each shim finds its data block: the kernel entry point and the accept list.
     SHIM_DATA = 0x0000_0c00;
     // The block runs to the reset vector; nothing else lives in the page.
@@ -76,6 +81,10 @@ const _: () = assert!(SHIM_BASE + SHIM_SIZE == KERNEL_SETUP_BASE);
 const _: () = assert!(KERNEL_SETUP_END <= KERNEL_BASE);
 const _: () = assert!(KERNEL_BASE < INITRAMFS_BASE);
 const _: () = assert!(SHIM_DATA + SHIM_DATA_SIZE <= SHIM_SIZE);
+// An IGVM VP context indexes processors in 16 bits.
+const _: () = assert!(MAX_VCPUS <= u16::MAX as u32);
+// The park stub is a handful of instructions; it must not run into the data block.
+const _: () = assert!(SHIM_AP_PARK + 64 <= SHIM_DATA);
 // A TD fetches its first instruction from the top of the 32-bit address space.
 const _: () = assert!(RESET_ALIAS + PAGE == 0x1_0000_0000);
 
@@ -99,8 +108,6 @@ const _: () = assert!(ACPI_DSDT + DSDT_LEN <= ACPI_MADT);
 pub const MAX_VCPUS: u32 =
     ((PAGE - ACPI_MADT - MADT_HEADER_LEN - MADT_WAKEUP_LEN) / MADT_LAPIC_LEN) as u32;
 
-// The file carries one SnpVpContext and no wakeup structure, so SNP runs one processor.
-pub const SNP_VCPU_COUNT: u32 = 1;
 // SEV_FEATURES, which QEMU forwards to KVM_SEV_INIT2: SNPActive only, no DebugSwap.
 pub const SNP_SEV_FEATURES: u64 = 1;
 
@@ -138,8 +145,14 @@ impl Params {
     }
 
     /// The SNP map, which places nothing inside the aperture, so it runs to 4 GiB.
-    pub fn snp(ram: u64, cbit: u8, cmdline: &str, mmio: Vec<(u64, u64)>) -> Result<Self, String> {
-        Self::new(ram, SNP_VCPU_COUNT, cmdline, cbit, mmio, FOUR_GIB)
+    pub fn snp(
+        ram: u64,
+        vcpus: u32,
+        cbit: u8,
+        cmdline: &str,
+        mmio: Vec<(u64, u64)>,
+    ) -> Result<Self, String> {
+        Self::new(ram, vcpus, cmdline, cbit, mmio, FOUR_GIB)
     }
 
     fn new(

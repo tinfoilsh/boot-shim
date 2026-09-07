@@ -137,13 +137,16 @@ mod tests {
         assert_eq!(a[mo + madt_len(DEFAULT_VCPUS, false) as usize], MADT_WAKEUP);
     }
     #[test]
-    fn snp_madt_advertises_only_the_provisioned_cpu() {
-        let a = build(SNP_VCPU_COUNT, false);
-        let at = ACPI_MADT as usize + 4;
-        let len = u32::from_le_bytes(a[at..at + 4].try_into().unwrap()) as u64;
-        assert_eq!(len, madt_len(SNP_VCPU_COUNT, false));
-        // Linux starts an application processor only through the wakeup structure.
-        assert_eq!(SNP_VCPU_COUNT, 1);
+    fn snp_madt_scales_with_the_processor_count_and_has_no_wakeup() {
+        // SNP launches every processor from its own measured VMSA, so the MADT
+        // advertises them all but offers no wakeup structure to start them.
+        for cpus in [1, 2, 16] {
+            let a = build(cpus, false);
+            let at = ACPI_MADT as usize + 4;
+            let len = u32::from_le_bytes(a[at..at + 4].try_into().unwrap()) as u64;
+            assert_eq!(len, madt_len(cpus, false));
+            assert_eq!(len, MADT_HEADER_LEN + cpus as u64 * MADT_LAPIC_LEN);
+        }
     }
     #[test]
     fn the_largest_allowed_madt_still_fits_its_measured_page() {

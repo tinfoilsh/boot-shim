@@ -118,7 +118,7 @@ pub fn build(
 ) -> Result<(), String> {
     let host_data = config_field(config_hash, 32)?;
     let p = prepare(kernel_path, initramfs_path, params)?;
-    let acpi = acpi::build(SNP_VCPU_COUNT, false);
+    let acpi = acpi::build(params.vcpus, false);
 
     // The one authoritative map, as on TDX: E820, the imported pages and the accept list.
     let mut placed = vec![
@@ -168,10 +168,18 @@ pub fn build(
     }
     validate_pages(&pages)?;
 
-    let directive_vmsa = directive_vmsa();
-    validate_vmsa(&directive_vmsa)?;
-    let vmsa = vmsa_page(&directive_vmsa);
-    let measurement = launch_measurement(&pages, &vmsa);
+    // One measured VMSA per processor. The APs are identical to each other and
+    // differ from the boot processor only in where they start and that they own
+    // no stack, so the digest stays a function of the processor count alone.
+    let bsp_vmsa = bsp_vmsa();
+    validate_vmsa(&bsp_vmsa, SHIM_BASE, BSP_STACK_TOP, ZERO_PAGE)?;
+    let ap_vmsa = ap_vmsa();
+    validate_vmsa(&ap_vmsa, SNP_AP_ENTRY, 0, 0)?;
+    let vmsa = vmsa_page(&bsp_vmsa);
+    let ap_page = vmsa_page(&ap_vmsa);
+    let mut vmsa_pages = vec![vmsa.clone()];
+    vmsa_pages.extend((1..params.vcpus).map(|_| ap_page.clone()));
+    let measurement = launch_measurement(&pages, &vmsa_pages);
     // The loader must find memory wherever E820 claims some and none in the apertures.
     let mut spans: Vec<(u64, u64)> = Vec::new();
     for (base, size, _) in &e820 {
@@ -199,13 +207,20 @@ pub fn build(
             .iter()
             .map(|p| page_directive(p.gpa, p.kind, p.data.clone())),
     );
-    // KVM consumes the VMSA last and only at this architectural high GPA.
-    directives.push(IgvmDirectiveHeader::SnpVpContext {
-        gpa: SNP_VMSA,
-        compatibility_mask: COMPAT,
-        vp_index: 0,
-        vmsa: directive_vmsa.clone(),
-    });
+    // KVM consumes the VMSAs last and only at this architectural high GPA, which
+    // QEMU checks per context; the vp index is what separates them.
+    for vp_index in 0..params.vcpus as u16 {
+        directives.push(IgvmDirectiveHeader::SnpVpContext {
+            gpa: SNP_VMSA,
+            compatibility_mask: COMPAT,
+            vp_index,
+            vmsa: if vp_index == 0 {
+                bsp_vmsa.clone()
+            } else {
+                ap_vmsa.clone()
+            },
+        });
+    }
     let signed = match id_key {
         None => None,
         Some(path) => {
@@ -241,15 +256,18 @@ pub fn build(
 
     let mut components = components(&placed);
     components.insert("vmsa", component(SNP_VMSA, &vmsa));
+    if params.vcpus > 1 {
+        components.insert("vmsa_ap", component(SNP_VMSA, &ap_page));
+    }
     let manifest = Manifest {
         format_version: 1,
         platform: "sev-snp",
         memory_bytes: params.memory,
         topology: Topology {
             sockets: 1,
-            cores: SNP_VCPU_COUNT as u8,
+            cores: params.vcpus as u8,
             threads_per_core: 1,
-            vcpus: SNP_VCPU_COUNT,
+            vcpus: params.vcpus,
         },
         command_line: params.cmdline.clone(),
         mmio_holes: mmio_holes(params),
@@ -361,7 +379,7 @@ fn snp_attestation(
     r
 }
 
-fn directive_vmsa() -> Box<SevVmsa> {
+fn bsp_vmsa() -> Box<SevVmsa> {
     let mut v = SevVmsa::new_box_zeroed();
     let data = SevSelector {
         selector: BOOT_DS as u16,
@@ -416,7 +434,18 @@ fn directive_vmsa() -> Box<SevVmsa> {
 }
 
 // QEMU supplies from its own reset state every field this file leaves unstated.
-fn validate_vmsa(v: &SevVmsa) -> Result<(), String> {
+/// An AP differs from the boot processor only in where it starts: it parks in
+/// the shim with no stack and no zero page, since Linux replaces this VMSA
+/// through the GHCB AP-creation call before the processor does any real work.
+fn ap_vmsa() -> Box<SevVmsa> {
+    let mut v = bsp_vmsa();
+    v.rip = SNP_AP_ENTRY;
+    v.rsp = 0;
+    v.rsi = 0;
+    v
+}
+
+fn validate_vmsa(v: &SevVmsa, rip: u64, rsp: u64, rsi: u64) -> Result<(), String> {
     let data = |s: &SevSelector, sel: u64, attrib: u16| {
         s.selector == sel as u16 && s.attrib == attrib && s.limit == SEG_LIMIT && s.base == 0
     };
@@ -425,9 +454,9 @@ fn validate_vmsa(v: &SevVmsa) -> Result<(), String> {
         && v.cr4 == VMSA_CR4
         && v.efer == VMSA_EFER
         && v.rdx == 0
-        && v.rip == SHIM_BASE
-        && v.rsp == BSP_STACK_TOP
-        && v.rsi == ZERO_PAGE
+        && v.rip == rip
+        && v.rsp == rsp
+        && v.rsi == rsi
         && v.rflags == VMSA_RFLAGS
         && v.vmpl == 0
         && v.dr6 == VMSA_DR6
@@ -491,12 +520,17 @@ fn cc_blob() -> Vec<u8> {
     v
 }
 
-fn launch_measurement(pages: &[LaunchPage], vmsa: &[u8]) -> [u8; 48] {
+fn launch_measurement(pages: &[LaunchPage], vmsas: &[Vec<u8>]) -> [u8; 48] {
     let mut digest = [0u8; 48];
     for p in pages {
         digest = extend(digest, p.gpa, measure_kind(p.kind), &p.data);
     }
-    extend(digest, SNP_VMSA, PAGE_VMSA, vmsa)
+    // KVM updates the VMSAs in vp index order once the pages are in, so the
+    // digest takes them in that order too.
+    for vmsa in vmsas {
+        digest = extend(digest, SNP_VMSA, PAGE_VMSA, vmsa);
+    }
+    digest
 }
 
 // The PAGE_INFO type SNP_LAUNCH_UPDATE stamps on each imported page.
@@ -553,7 +587,7 @@ mod tests {
 
     #[test]
     fn vmsa_is_the_pinned_reset_state() {
-        let v = directive_vmsa();
+        let v = bsp_vmsa();
         assert_eq!(vmsa_page(&v).len(), 4096);
         assert_eq!(v.cr0, 0x31);
         assert_eq!(v.cr3, 0);
@@ -565,7 +599,7 @@ mod tests {
         assert_eq!(v.mxcsr, 0x1f80);
         assert_eq!(v.x87_fcw, 0x037f);
         assert_eq!(v.rsi, ZERO_PAGE);
-        assert!(validate_vmsa(&v).is_ok());
+        assert!(validate_vmsa(&v, SHIM_BASE, BSP_STACK_TOP, ZERO_PAGE).is_ok());
         // Drift in the state QEMU supplies changes the measurement, so none goes unchecked.
         for break_it in [
             (|v: &mut SevVmsa| v.dr6 = 0) as fn(&mut SevVmsa),
@@ -583,9 +617,9 @@ mod tests {
             |v| v.cs.attrib = 0,
             |v| v.ds.selector = 0,
         ] {
-            let mut v = directive_vmsa();
+            let mut v = bsp_vmsa();
             break_it(&mut v);
-            assert!(validate_vmsa(&v).is_err());
+            assert!(validate_vmsa(&v, SHIM_BASE, BSP_STACK_TOP, ZERO_PAGE).is_err());
         }
     }
     #[test]
@@ -623,7 +657,7 @@ mod tests {
         add_special(&mut p, 0x2000, IgvmPageDataType::SECRETS);
         add_special(&mut p, 0x3000, IgvmPageDataType::CPUID_DATA);
         assert_eq!(
-            hex::encode(launch_measurement(&p, &vec![0u8; PAGE as usize])),
+            hex::encode(launch_measurement(&p, &[vec![0u8; PAGE as usize]])),
             "64fba8d7f08e6c2b07f7a3fd610e2965a1683a3ca18ad66a73acc84e5cc2ebfb\
 1721d1bcfebf8752aeac62b6fd5f8ace"
         );
@@ -634,14 +668,14 @@ mod tests {
         add_special(&mut a, SNP_SECRETS, IgvmPageDataType::SECRETS);
         let mut b = a.clone();
         b[0].data[0] = 1;
-        let v = vmsa_page(&directive_vmsa());
+        let v = vec![vmsa_page(&bsp_vmsa())];
         assert_eq!(launch_measurement(&a, &v), launch_measurement(&b, &v));
     }
     #[test]
     fn measurement_changes_with_content() {
         let mut p = Vec::new();
         add_normal(&mut p, 0x1000, &[0; 4096]);
-        let v = vmsa_page(&directive_vmsa());
+        let v = vec![vmsa_page(&bsp_vmsa())];
         let a = launch_measurement(&p, &v);
         p[0].data[0] = 1;
         assert_ne!(a, launch_measurement(&p, &v));
@@ -711,6 +745,70 @@ mod tests {
         let b = id_block(TEST_KEY, &[1; 48], 0).unwrap();
         assert_eq!(a.key_digest, b.key_digest);
         assert_eq!(format!("{:?}", a.header), format!("{:?}", b.header));
+    }
+
+    #[test]
+    fn an_ap_parks_in_the_shim_and_owns_no_stack() {
+        let ap = ap_vmsa();
+        assert_eq!(ap.rip, SNP_AP_ENTRY);
+        assert_eq!(ap.rsp, 0);
+        assert_eq!(ap.rsi, 0);
+        // Everything the firmware measures besides the entry state matches the
+        // boot processor, so a reader can diff the two contexts and see only it.
+        let bsp = bsp_vmsa();
+        assert_eq!(ap.cs.selector, bsp.cs.selector);
+        assert_eq!(ap.cr0, bsp.cr0);
+        assert_eq!(ap.efer, bsp.efer);
+        assert_eq!(ap.sev_features.into_bits(), SNP_SEV_FEATURES);
+        assert!(validate_vmsa(&ap, SNP_AP_ENTRY, 0, 0).is_ok());
+        // An AP that kept the boot processor's entry state would run the shim twice.
+        assert!(validate_vmsa(&bsp, SNP_AP_ENTRY, 0, 0).is_err());
+    }
+
+    #[test]
+    fn the_launch_digest_covers_one_vmsa_per_processor() {
+        let mut pages = Vec::new();
+        add_normal(&mut pages, 0x1000, &[0; PAGE as usize]);
+        let bsp = vmsa_page(&bsp_vmsa());
+        let ap = vmsa_page(&ap_vmsa());
+
+        let one = launch_measurement(&pages, &[bsp.clone()]);
+        let two = launch_measurement(&pages, &[bsp.clone(), ap.clone()]);
+        let three = launch_measurement(&pages, &[bsp.clone(), ap.clone(), ap.clone()]);
+        // Adding a processor adds a measured VMSA, so the digest has to move.
+        assert_ne!(one, two);
+        assert_ne!(two, three);
+        // And the order is vp index order, not an unordered set.
+        assert_ne!(two, launch_measurement(&pages, &[ap, bsp]));
+    }
+
+    #[test]
+    fn an_snp_image_carries_one_vp_context_per_processor() {
+        let dir = tempdir().unwrap();
+        let (k, i) = (dir.path().join("bzImage"), dir.path().join("initrd"));
+        fs::write(&k, test_kernel()).unwrap();
+        fs::write(&i, vec![7u8; 100_000]).unwrap();
+        for cpus in [1u32, 2, 4] {
+            let out = dir.path().join(format!("out{cpus}.igvm"));
+            let params = Params::snp(DEFAULT_RAM, cpus, DEFAULT_CBIT, "", vec![]).unwrap();
+            build(&k, &i, &out, &params, None, None, 0).unwrap();
+            let bytes = fs::read(&out).unwrap();
+            let file = IgvmFile::new_from_binary(&bytes, None).unwrap();
+            let mut indexes: Vec<u16> = file
+                .directives()
+                .iter()
+                .filter_map(|d| match d {
+                    IgvmDirectiveHeader::SnpVpContext { vp_index, gpa, .. } => {
+                        // QEMU rejects any VP context that is not at this GPA.
+                        assert_eq!(*gpa, SNP_VMSA);
+                        Some(*vp_index)
+                    }
+                    _ => None,
+                })
+                .collect();
+            indexes.sort_unstable();
+            assert_eq!(indexes, (0..cpus as u16).collect::<Vec<_>>());
+        }
     }
 
     #[test]
