@@ -21,7 +21,7 @@ Already-imported pages must not be accepted or validated again on both TDX and S
 
 On TDX, every image page contributes to MRTD. The reset shim enters long mode, parks application processors in the ACPI wakeup mailbox, accepts the remaining private RAM, and jumps to Linux.
 
-On SEV-SNP, the launch measurement covers the normal pages and VMSA. The reset shim enters long mode, validates and clears the remaining private RAM, and jumps to Linux. The current SNP image provisions one processor.
+On SEV-SNP, the launch measurement covers the normal pages and one Virtual Machine Save Area (VMSA) per processor. The reset shim enters long mode, validates and clears the remaining private RAM, and jumps to Linux.
 
 The SNP image reaches Linux through a confidential-computing blob on the `setup_data` chain. The record and the blob share one measured page of E820 RAM, and the record claims the whole page. Linux re-reads the chain long after boot, in `pcibios_device_add()`, and `memremap()` hands back ciphertext for a page outside the RAM map, which leaves every PCI device without an MSI domain.
 
@@ -55,7 +55,7 @@ Each command writes an IGVM file and an adjacent JSON manifest. The manifest con
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `--ram` | `1G` | Guest RAM, matching QEMU `-m` |
-| `--vcpus` | `4` | TDX processor count |
+| `--vcpus` | `4` | Processor count; SNP measures one VMSA per processor |
 | `--cmdline` | `panic=-1` | Linux command line |
 | `--mmio-hole` | none | Additional MMIO aperture |
 | `--config-hash` | zero | TDX `MRCONFIGID` or SNP `HOST_DATA` |

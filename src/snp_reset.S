@@ -125,6 +125,26 @@ zero_2m:
 validated:
     ret
 
+    # An application processor launches from its own measured VMSA in 32-bit
+    # protected mode and parks here until Linux creates it for real through the
+    # GHCB AP-creation call, which replaces this VMSA wholesale.
+    #
+    # The wait is an AP Reset Hold over the GHCB MSR protocol, not a HLT: under
+    # SEV-ES a HLT is a non-automatic exit, so it would raise #VC into an AP that
+    # has no IDT and triple-fault it. Reset Hold is the one park the hypervisor
+    # can resume, and like the termination request below it needs no GHCB page.
+    .code32
+    .org SHIM_AP_PARK
+.global snp_ap_park
+snp_ap_park:
+    cli
+1:  mov $0xc0010130, %ecx
+    xor %edx, %edx
+    mov $6, %eax                    # GHCB MSR AP Reset Hold request
+    wrmsr
+    vmgexit
+    jmp 1b                          # re-park if the host resumes us early
+
     # The kernel entry point and the ranges to validate, written here by the builder.
     .org SHIM_DATA
 shim_data:

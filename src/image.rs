@@ -439,7 +439,7 @@ pub mod tests {
     #[test]
     fn every_range_the_shim_is_told_to_touch_is_mapped() {
         for ram in [DEFAULT_RAM, 16 * GIB, MAX_RAM] {
-            let params = Params::snp(ram, DEFAULT_CBIT, "", vec![]).unwrap();
+            let params = Params::snp(ram, DEFAULT_VCPUS, DEFAULT_CBIT, "", vec![]).unwrap();
             let map = identity_map(params.cbit as u64);
             let placed = vec![Placed::measured(
                 KERNEL_BASE,
@@ -451,7 +451,7 @@ pub mod tests {
                 assert_eq!(pdpte(&map, hi - PAGE) & 1, 1, "{hi:#x} is unmapped");
             }
         }
-        assert!(Params::snp(MAX_RAM + PAGE, DEFAULT_CBIT, "", vec![]).is_err());
+        assert!(Params::snp(MAX_RAM + PAGE, DEFAULT_VCPUS, DEFAULT_CBIT, "", vec![]).is_err());
     }
 
     #[test]
@@ -616,7 +616,7 @@ pub mod tests {
         assert_eq!(p.memory, 10 * GIB);
         // TDX loads the reset page inside the aperture; SNP loads nothing there.
         assert_eq!(p.mmio, vec![(2 * GIB, RESET_ALIAS - 2 * GIB)]);
-        let snp = Params::snp(8 * GIB, DEFAULT_CBIT, "", vec![]).unwrap();
+        let snp = Params::snp(8 * GIB, DEFAULT_VCPUS, DEFAULT_CBIT, "", vec![]).unwrap();
         assert_eq!(snp.mmio, vec![(2 * GIB, 2 * GIB)]);
 
         let placed: Vec<Placed> = p

@@ -33,6 +33,10 @@ struct Common {
     /// Linux command line, measured whole, with `no5lvl` always appended.
     #[arg(long, default_value = "", hide_default_value = true)]
     cmdline: String,
+    /// Processor count, which the measured MADT advertises. SNP additionally
+    /// measures one VMSA per processor, so this changes the launch digest.
+    #[arg(long, default_value_t = DEFAULT_VCPUS)]
+    vcpus: u32,
     /// A further MMIO aperture besides the machine's own, as BASE:SIZE, repeatable.
     #[arg(long, value_name = "BASE:SIZE", value_parser = parse_hole)]
     mmio_hole: Vec<(u64, u64)>,
@@ -44,9 +48,6 @@ enum Command {
     BuildTdx {
         #[command(flatten)]
         common: Common,
-        /// Processor count, which the measured MADT advertises.
-        #[arg(long, default_value_t = DEFAULT_VCPUS)]
-        vcpus: u32,
         /// MRCONFIGID the host must pass, 48 hex-encoded bytes.
         #[arg(long)]
         config_hash: Option<String>,
@@ -97,10 +98,9 @@ fn run() -> Result<(), String> {
     match Cli::parse().command {
         Command::BuildTdx {
             common,
-            vcpus,
             config_hash,
         } => {
-            let params = Params::tdx(common.ram, vcpus, &common.cmdline, common.mmio_hole)?;
+            let params = Params::tdx(common.ram, common.vcpus, &common.cmdline, common.mmio_hole)?;
             image::build(
                 &common.kernel,
                 &common.initramfs,
@@ -116,7 +116,13 @@ fn run() -> Result<(), String> {
             id_key,
             guest_svn,
         } => {
-            let params = Params::snp(common.ram, cbit, &common.cmdline, common.mmio_hole)?;
+            let params = Params::snp(
+                common.ram,
+                common.vcpus,
+                cbit,
+                &common.cmdline,
+                common.mmio_hole,
+            )?;
             snp::build(
                 &common.kernel,
                 &common.initramfs,
