@@ -188,7 +188,7 @@ pub fn build(
         Placed::measured(CMDLINE, "command_line", RESERVED, p.command.clone()),
         Placed::measured(ACPI_BASE, "acpi", ACPI, acpi.clone()),
         Placed::measured(MAILBOX, "", RESERVED, vec![0u8; PAGE as usize]),
-        Placed::measured(PAGE_TABLES, "", RESERVED, identity_map(0)),
+        Placed::measured(PAGE_TABLES, "", RESERVED, identity_map(0, false)),
         Placed::measured(BSP_STACK, "", RESERVED, boot::gdt_stack()),
         Placed::measured(KERNEL_SETUP_BASE, "kernel_setup", RESERVED, p.setup.clone()),
         Placed::measured(KERNEL_BASE, "kernel", RAM, p.kernel.clone()),
@@ -356,12 +356,18 @@ fn tdx_attestation(mrtd: &[u8; 48], mrconfigid: String) -> Required {
 }
 
 /// The 4-level map covering [0, MAP_LIMIT); `c_bit` is 0 on TDX and the C-bit on SNP.
-pub fn identity_map(c_bit: u64) -> Vec<u8> {
+pub fn identity_map(c_bit: u64, shared_alias: bool) -> Vec<u8> {
     let c = if c_bit == 0 { 0 } else { 1u64 << c_bit };
-    let mut v = vec![0u8; PAGE_TABLE_SIZE as usize];
+    let pages = if shared_alias { 3 } else { 2 };
+    let mut v = vec![0u8; pages * PAGE as usize];
     put64(&mut v, 0, (PAGE_TABLES + PAGE) | c | 3);
     for gib in 0..MAP_LIMIT / GIB {
         put64(&mut v, (PAGE + gib * 8) as usize, (gib * GIB) | c | 0x83);
+    }
+    if shared_alias {
+        // PML4[1] -> a second PDPT whose first entry is physical GiB 0, unencrypted.
+        put64(&mut v, 8, (PAGE_TABLES + 2 * PAGE) | c | 3);
+        put64(&mut v, (2 * PAGE) as usize, 0x83);
     }
     v
 }
@@ -409,7 +415,7 @@ pub mod tests {
 
     #[test]
     fn identity_map_reaches_the_bound_memory_is_held_to() {
-        let p = identity_map(0);
+        let p = identity_map(0, false);
         // PML4[0] points at the PDPT that follows it, whose entries are 1-GiB pages.
         assert_eq!(
             u64::from_le_bytes(p[..8].try_into().unwrap()),
@@ -418,8 +424,9 @@ pub mod tests {
         assert_eq!(pdpte(&p, 0), 0x83);
         assert_eq!(pdpte(&p, MAP_LIMIT - GIB), (MAP_LIMIT - GIB) | 0x83);
         assert_eq!(pdpte(&p, RESET_ALIAS) & 1, 1);
-        let e = identity_map(DEFAULT_CBIT as u64);
-        for at in (0..PAGE_TABLE_SIZE as usize).step_by(8) {
+        let e = identity_map(DEFAULT_CBIT as u64, false);
+        assert_eq!(p.len(), e.len());
+        for at in (0..p.len()).step_by(8) {
             let (plain, enc) = (
                 u64::from_le_bytes(p[at..at + 8].try_into().unwrap()),
                 u64::from_le_bytes(e[at..at + 8].try_into().unwrap()),
@@ -435,12 +442,25 @@ pub mod tests {
         }
     }
 
+    /// On SNP, PML4[1] reaches physical GiB 0 again with the C-bit clear, and nothing else.
+    #[test]
+    fn the_shared_alias_maps_gib_zero_unencrypted() {
+        let m = identity_map(DEFAULT_CBIT as u64, true);
+        assert_eq!(m.len(), 3 * PAGE as usize);
+        let pml4_1 = u64::from_le_bytes(m[8..16].try_into().unwrap());
+        assert_eq!(pml4_1, (PAGE_TABLES + 2 * PAGE) | 1 << DEFAULT_CBIT | 3);
+        let alias = &m[2 * PAGE as usize..];
+        assert_eq!(u64::from_le_bytes(alias[..8].try_into().unwrap()), 0x83);
+        assert!(alias[8..].iter().all(|b| *b == 0));
+        assert_eq!(SHARED_ALIAS, 512 * GIB);
+    }
+
     /// The SNP shim PVALIDATEs and zeroes through the map, so every range it walks is mapped.
     #[test]
     fn every_range_the_shim_is_told_to_touch_is_mapped() {
         for ram in [DEFAULT_RAM, 16 * GIB, MAX_RAM] {
             let params = Params::snp(ram, DEFAULT_VCPUS, DEFAULT_CBIT, "", vec![]).unwrap();
-            let map = identity_map(params.cbit as u64);
+            let map = identity_map(params.cbit as u64, true);
             let placed = vec![Placed::measured(
                 KERNEL_BASE,
                 "",

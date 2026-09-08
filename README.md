@@ -21,7 +21,9 @@ Already-imported pages must not be accepted or validated again on both TDX and S
 
 On TDX, every image page contributes to MRTD. The reset shim enters long mode, parks application processors in the ACPI wakeup mailbox, accepts the remaining private RAM, and jumps to Linux.
 
-On SEV-SNP, the launch measurement covers the normal pages and one Virtual Machine Save Area (VMSA) per processor. The reset shim enters long mode, validates and clears the remaining private RAM, and jumps to Linux.
+On SEV-SNP, the launch measurement covers the normal pages and one Virtual Machine Save Area (VMSA) per processor. The reset shim enters long mode, validates and clears the remaining private RAM, wakes the application processors, and jumps to Linux.
+
+Each SEV-SNP application processor launches from its own measured VMSA into a park stub, where it waits on a Guest-Hypervisor Communication Block (GHCB) AP Reset Hold until Linux replaces its VMSA through the GHCB AP-creation call. KVM starts every non-boot processor in the wait-for-SIPI state and only an INIT takes it out, so the boot processor sends INIT-SIPI-SIPI first, as firmware would. Under SEV-ES the local APIC is reachable only through the GHCB, so the shim rescinds one measured page, makes it shared, registers it as its GHCB, and issues the three interrupt-command writes through it. The page is returned to private afterwards, and Linux registers its own GHCB.
 
 The SNP image reaches Linux through a confidential-computing blob on the `setup_data` chain. The record and the blob share one measured page of E820 RAM, and the record claims the whole page. Linux re-reads the chain long after boot, in `pcibios_device_add()`, and `memremap()` hands back ciphertext for a page outside the RAM map, which leaves every PCI device without an MSI domain.
 
@@ -87,7 +89,7 @@ git am /path/to/boot-shim/qemu-patches/qemu-10.1.0-0001-igvm-tdx.patch
 ```
 
 The patch is named for the release it applies to and carries that release's
-tarball sha256 in its message.
+tarball sha256 in its message. SEV-SNP needs no QEMU patch.
 
 ## SEV-SNP policy
 
