@@ -19,11 +19,15 @@ layout! {
     SNP_SECRETS = 0x000f_1000;
     SNP_CC_BLOB = 0x000f_2000;
     PAGE_TABLES = 0x0010_0000;
-    // One PML4 page and one PDPT page of 1-GiB pages; see MAP_LIMIT.
-    PAGE_TABLE_SIZE = 2 * PAGE;
+    // The most either platform places: one PML4 page and one PDPT page of 1-GiB pages
+    // (see MAP_LIMIT), plus on SNP a second PDPT page aliasing physical GiB 0 without
+    // the C-bit (see SHARED_ALIAS). TDX places the first two only.
+    PAGE_TABLE_SIZE = 3 * PAGE;
     BSP_STACK = 0x0010_7000;
     BSP_STACK_SIZE = 0x0001_0000;
     BSP_STACK_TOP = BSP_STACK + BSP_STACK_SIZE;
+    // The page the SNP shim shares with the host as its GHCB, to wake the other processors.
+    SNP_GHCB = 0x0011_7000;
     SHIM_BASE = 0x0012_0000;
     SHIM_SIZE = PAGE;
     KERNEL_SETUP_BASE = 0x0012_1000;
@@ -48,6 +52,10 @@ layout! {
     SHIM_AP_PARK = 0x0000_0b00;
     SNP_AP_ENTRY = SHIM_BASE + SHIM_AP_PARK;
 
+    // Physical GiB 0 seen again through PML4[1] with the C-bit clear: how the SNP
+    // shim writes the one page it has made shared.
+    SHARED_ALIAS = 0x80_0000_0000;
+
     // Where each shim finds its data block: the kernel entry point and the accept list.
     SHIM_DATA = 0x0000_0c00;
     // The block runs to the reset vector; nothing else lives in the page.
@@ -58,7 +66,7 @@ layout! {
 
 pub const SHIM_LIMIT: usize = 256 * 1024;
 
-// The two page-table pages reach this far; past it a shim faults with no IDT installed.
+// The identity map reaches this far; past it a shim faults with no IDT installed.
 pub const GIB: u64 = 0x4000_0000;
 pub const MAP_LIMIT: u64 = 512 * GIB;
 const FOUR_GIB: u64 = 4 * GIB;
@@ -76,7 +84,8 @@ const _: () = assert!(SNP_CPUID + PAGE == SNP_SECRETS && SNP_SECRETS + PAGE == S
 const _: () = assert!(SNP_CC_BLOB + PAGE <= PAGE_TABLES);
 const _: () = assert!(PAGE_TABLES + PAGE_TABLE_SIZE <= BSP_STACK);
 const _: () = assert!(GDT_PTR + 10 <= BSP_STACK_TOP);
-const _: () = assert!(BSP_STACK_TOP <= SHIM_BASE);
+const _: () = assert!(BSP_STACK_TOP <= SNP_GHCB && SNP_GHCB + PAGE <= SHIM_BASE);
+const _: () = assert!(SHARED_ALIAS == MAP_LIMIT);
 const _: () = assert!(SHIM_BASE + SHIM_SIZE == KERNEL_SETUP_BASE);
 const _: () = assert!(KERNEL_SETUP_END <= KERNEL_BASE);
 const _: () = assert!(KERNEL_BASE < INITRAMFS_BASE);

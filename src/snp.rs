@@ -129,8 +129,14 @@ pub fn build(
         Placed::host(SNP_CPUID),
         Placed::host(SNP_SECRETS),
         Placed::measured(SNP_CC_BLOB, "cc_blob", RAM, cc_blob()),
-        Placed::measured(PAGE_TABLES, "", RESERVED, identity_map(params.cbit as u64)),
+        Placed::measured(
+            PAGE_TABLES,
+            "",
+            RESERVED,
+            identity_map(params.cbit as u64, true),
+        ),
         Placed::measured(BSP_STACK, "", RESERVED, boot::gdt_stack()),
+        Placed::measured(SNP_GHCB, "", RESERVED, vec![0u8; PAGE as usize]),
         Placed::measured(SHIM_BASE, "shim", RESERVED, vec![0u8; PAGE as usize]),
         Placed::measured(KERNEL_SETUP_BASE, "kernel_setup", RESERVED, p.setup.clone()),
         Placed::measured(KERNEL_BASE, "kernel", RAM, p.kernel.clone()),
@@ -809,6 +815,59 @@ mod tests {
             indexes.sort_unstable();
             assert_eq!(indexes, (0..cpus as u16).collect::<Vec<_>>());
         }
+    }
+
+    /// The GHCB page is loaded and E820-reserved, and the shim never validates it itself.
+    #[test]
+    fn the_ghcb_page_is_placed_reserved_and_not_accepted() {
+        let dir = tempdir().unwrap();
+        let (k, i, out) = (
+            dir.path().join("bzImage"),
+            dir.path().join("initrd"),
+            dir.path().join("out.igvm"),
+        );
+        fs::write(&k, test_kernel()).unwrap();
+        fs::write(&i, vec![7u8; 100_000]).unwrap();
+        build(&k, &i, &out, &params(), None, None, 0).unwrap();
+        let bytes = fs::read(&out).unwrap();
+        let file = IgvmFile::new_from_binary(&bytes, None).unwrap();
+        let pages: BTreeMap<u64, Vec<u8>> = file
+            .directives()
+            .iter()
+            .filter_map(|d| match d {
+                IgvmDirectiveHeader::PageData {
+                    gpa,
+                    data,
+                    data_type,
+                    ..
+                } if *data_type == IgvmPageDataType::NORMAL => Some((*gpa, data.clone())),
+                _ => None,
+            })
+            .collect();
+        assert!(pages.contains_key(&SNP_GHCB));
+        let (_, ranges) = crate::image::tests::shim_ranges(&pages[&SHIM_BASE]);
+        assert!(!ranges.is_empty());
+        assert!(!ranges
+            .iter()
+            .any(|(lo, hi)| *lo <= SNP_GHCB && SNP_GHCB < *hi));
+        // The zero page's E820 map: entry count at 0x1e8, 20-byte entries from 0x2d0.
+        let zero = &pages[&ZERO_PAGE];
+        let count = zero[0x1e8] as usize;
+        let e820: Vec<(u64, u64, u32)> = (0..count)
+            .map(|n| {
+                let at = 0x2d0 + n * 20;
+                (
+                    u64::from_le_bytes(zero[at..at + 8].try_into().unwrap()),
+                    u64::from_le_bytes(zero[at + 8..at + 16].try_into().unwrap()),
+                    u32::from_le_bytes(zero[at + 16..at + 20].try_into().unwrap()),
+                )
+            })
+            .collect();
+        let kind = e820
+            .iter()
+            .find(|(base, size, _)| *base <= SNP_GHCB && SNP_GHCB < base + size)
+            .map(|(_, _, kind)| *kind);
+        assert_eq!(kind, Some(RESERVED));
     }
 
     #[test]
