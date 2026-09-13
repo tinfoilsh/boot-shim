@@ -778,7 +778,7 @@ mod tests {
         let bsp = vmsa_page(&bsp_vmsa());
         let ap = vmsa_page(&ap_vmsa());
 
-        let one = launch_measurement(&pages, &[bsp.clone()]);
+        let one = launch_measurement(&pages, std::slice::from_ref(&bsp));
         let two = launch_measurement(&pages, &[bsp.clone(), ap.clone()]);
         let three = launch_measurement(&pages, &[bsp.clone(), ap.clone(), ap.clone()]);
         // Adding a processor adds a measured VMSA, so the digest has to move.
