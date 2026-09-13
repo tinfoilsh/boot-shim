@@ -182,11 +182,11 @@ SEV-SNP:
 
 ## Reproducible build
 
-`cargo build` pins rustc through `rust-toolchain`, and nothing else. rustc
-hands the final link to `cc`, so the binary still depends on the host's gcc,
-ld and glibc: two machines running the same pinned rustc 1.88.0 produced
-different binaries from identical source, differing only in gcc 15.2 against
-13.3, binutils 2.46 against 2.42, and glibc 2.43 against 2.39.
+`cargo build` pins rustc and nothing else. rustc hands the final link to `cc`,
+so the binary still depends on the host's gcc, ld and glibc: two machines
+running the same pinned rustc produced different binaries from identical
+source, differing only in gcc 15.2 against 13.3, binutils 2.46 against 2.42,
+and glibc 2.43 against 2.39.
 
 `default.nix` pins all of them, at the nixpkgs revision cvmimage builds
 against:

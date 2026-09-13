@@ -8,11 +8,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # The toolchain action does not read rust-toolchain, so hand it the
+      # version the file states rather than pinning it a second time here.
+      - id: toolchain
+        run: echo "version=$(cat rust-toolchain)" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.88.0
+          toolchain: ${{ steps.toolchain.outputs.version }}
           components: rustfmt, clippy
       - run: cargo fmt -- --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --locked
       - run: cargo build --release --locked
+
+  nix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - run: nix-build

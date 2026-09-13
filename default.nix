@@ -1,9 +1,9 @@
 # A reproducible build of the builder.
 #
-# `cargo build` pins only rustc, through rust-toolchain. The binary it produces
-# still depends on the machine: rustc hands the final link to cc, so a
-# different gcc, ld or glibc yields a different binary from identical source.
-# Two hosts running the same pinned rustc 1.88.0 produced different boot-shim
+# `cargo build` pins only rustc. The binary it produces still depends on the
+# machine: rustc hands the final link to cc, so a different gcc, ld or glibc
+# yields a different binary from identical source.
+# Two hosts running the same pinned rustc produced different boot-shim
 # binaries for exactly that reason -- gcc 15.2 vs 13.3, binutils 2.46 vs 2.42,
 # glibc 2.43 vs 2.39.
 #
@@ -31,7 +31,14 @@ let
     config = { };
     overlays = [ ];
   };
+  # One file states the compiler version. rustup reads it for a local cargo
+  # build and CI passes it to the toolchain action; the assert below makes a
+  # mismatch a build failure rather than two "pinned" builds quietly using
+  # different compilers, which is what happened before it existed.
+  toolchain = builtins.replaceStrings [ "\n" ] [ "" ] (builtins.readFile ./rust-toolchain);
 in
+assert pkgs.lib.assertMsg (pkgs.rustc.version == toolchain)
+  "rust-toolchain pins ${toolchain} but this nixpkgs provides rustc ${pkgs.rustc.version}";
 pkgs.rustPlatform.buildRustPackage {
   pname = "boot-shim";
   version = "0.1.0";
