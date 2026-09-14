@@ -7,7 +7,7 @@ jobs:
   rust:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # The toolchain action does not read rust-toolchain, so hand it the
       # version the file states rather than pinning it a second time here.
       - id: toolchain
@@ -24,6 +24,6 @@ jobs:
   nix:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: cachix/install-nix-action@v31
       - run: nix-build
