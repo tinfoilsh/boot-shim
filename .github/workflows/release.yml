@@ -1,72 +1,127 @@
 # Publish the builder, so that anyone handed an expected measurement can fetch
 # the thing that computed it, check its digest, and rebuild it themselves.
+#
+# Actions are pinned by commit rather than tag: this is the one workflow whose
+# output is signed, and a retagged action would change the bytes that get signed
+# while the attestation still verified.
 name: release
 on:
   push:
     tags:
       - "v*"
 
-permissions:
-  contents: write # create the release
-  id-token: write # keyless signing
-  attestations: write # publish the provenance
+# No permissions by default; each job asks for what it needs.
+permissions: {}
 
 jobs:
-  release:
-    runs-on: ubuntu-latest
+  # The build runs the crate's build script, its dependency tree and its test
+  # suite, so it is kept away from the token that can write to the repository
+  # and from the one that can mint an OIDC identity.
+  build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      # The tag is what a consumer pins, so it has to name the same version the
-      # crate reports.
-      - name: Check the tag matches the crate version
+      # A tag names a version people pin, so it must not be able to claim one
+      # the crate does not report, and it must not point somewhere off main.
+      - name: Check the tag
         run: |
-          crate="v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          set -euo pipefail
+          crate="v$(sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml | head -1)"
           if [ "$crate" != "$GITHUB_REF_NAME" ]; then
             echo "::error::tag $GITHUB_REF_NAME does not match crate version $crate"
             exit 1
           fi
+          git fetch --depth=100 origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::$GITHUB_REF_NAME is not on main"
+            exit 1
+          fi
 
-      - uses: cachix/install-nix-action@v31
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          nix_version: "2.32.3"
 
       - name: Build
         run: nix-build
 
-      # A release nobody can rebuild to the same bytes would defeat the point
-      # of publishing it, so the release fails rather than ships one.
+      # A release nobody can rebuild to the same bytes would defeat the point of
+      # publishing it. This compares two builds on this runner, which catches a
+      # derivation that is nondeterministic in itself; it cannot speak for a
+      # different machine, which is what the pinned toolchain is for.
       - name: Rebuild and compare
         run: nix-build --check
 
       - name: Stage the artifact
-        id: artifact
         run: |
+          set -euo pipefail
           install -m 0755 result/bin/boot-shim boot-shim
           sha256sum boot-shim > boot-shim.sha256
-          {
-            echo "sha256=$(cut -d' ' -f1 boot-shim.sha256)"
-            echo "store=$(readlink -f result)"
-          } >> "$GITHUB_OUTPUT"
 
-      - uses: actions/attest-build-provenance@v3
+      - uses: actions/upload-artifact@v4
+        with:
+          name: boot-shim
+          path: |
+            boot-shim
+            boot-shim.sha256
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # create the release
+      id-token: write # keyless signing
+      attestations: write # publish the provenance
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: boot-shim
+
+      - name: Check the artifact survived the handover
+        run: |
+          set -euo pipefail
+          chmod 0755 boot-shim
+          sha256sum -c boot-shim.sha256
+
+      # The release is created empty first, so a failure here cannot leave a
+      # signed provenance statement behind for a binary that never shipped.
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          prerelease=""
+          case "$GITHUB_REF_NAME" in *-*) prerelease="--prerelease" ;; esac
+          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" --draft $prerelease \
+              --title "$GITHUB_REF_NAME" --notes "Publishing."
+          fi
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: boot-shim
 
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
-          SHA256: ${{ steps.artifact.outputs.sha256 }}
-          STORE: ${{ steps.artifact.outputs.store }}
+          GH_REPO: ${{ github.repository }}
         run: |
+          set -euo pipefail
+          digest="$(cut -d' ' -f1 boot-shim.sha256)"
           {
             printf 'Reproducible build of the IGVM builder.\n\n'
-            printf '    sha256  %s\n' "$SHA256"
-            printf '    store   %s\n\n' "$STORE"
-            printf 'Rebuild and compare:\n\n'
-            printf '    git clone --branch %s https://github.com/tinfoilsh/boot-shim && cd boot-shim\n' "$GITHUB_REF_NAME"
+            printf '    sha256  %s\n\n' "$digest"
+            printf 'Verify what this binary claims to be:\n\n'
+            printf '    gh attestation verify boot-shim --repo %s\n\n' "$GITHUB_REPOSITORY"
+            printf 'Or rebuild it and compare:\n\n'
+            printf '    git clone --branch %s https://github.com/%s && cd boot-shim\n' "$GITHUB_REF_NAME" "$GITHUB_REPOSITORY"
             printf '    nix-build && sha256sum result/bin/boot-shim\n'
           } > notes.md
-          gh release create "$GITHUB_REF_NAME" \
-            --verify-tag \
-            --title "$GITHUB_REF_NAME" \
-            --notes-file notes.md \
-            boot-shim boot-shim.sha256
+          gh release upload "$GITHUB_REF_NAME" boot-shim boot-shim.sha256 --clobber
+          gh release edit "$GITHUB_REF_NAME" --draft=false --notes-file notes.md
