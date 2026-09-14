@@ -52,7 +52,7 @@ cargo run --release -- build-snp \
   --output image.igvm
 ```
 
-Each command writes an IGVM file and an adjacent JSON manifest. The manifest contains the expected launch measurement, component hashes, memory configuration, and fields that an attestation verifier must check separately.
+Each command writes an IGVM file and an adjacent JSON manifest. The manifest contains the expected launch measurement, component hashes, memory configuration, and the report fields this image fixes.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
@@ -147,38 +147,48 @@ Hotplug, suspend, kexec, and processor offlining are unsupported.
 
 ## Attestation
 
-The generated launch measurement does not cover every host-selected setting. In particular, MRTD does not cover TDX attributes or XFAM, and the SNP digest does not cover guest policy, platform configuration, or the reported TCB.
+The launch measurement does not cover every setting a report carries, so a
+verifier checks more than the digest. Those remaining fields split in two, and
+the split decides who is allowed to state them.
 
-Verify the measurement and every field in the manifest's `attestation` object. The manifest itself is unsigned and must be authenticated by the release process. A `null` value marks a field this build cannot predict: pin it to the value observed on a trusted launch, or to the lowest one you accept.
+The manifest's `launch` object holds the fields **this image** fixes. A
+different build changes them, so they belong with the measurement and are
+authenticated by whatever process authenticates the manifest — the manifest
+itself is unsigned.
 
 TDX:
 
-| Field | Required | Why the digest cannot carry it |
+| Field | Value | Why the digest cannot carry it |
 | --- | --- | --- |
-| `attributes` | `SEPT_VE_DISABLE`, under `attributes_mask` | A TD launched with `DEBUG` or `MIGRATABLE` set produces a byte-identical MRTD |
-| `xfam` | operator | The host picks it at `TDH.MNG.INIT` |
-| `mrconfigid` | `--config-hash` | Passed by the host at launch |
-| `mrowner`, `mrownerconfig` | zero | Passed by the host at launch |
-| `servtd_hash` | zero | A TD migrates only through a bound migration TD |
-| `tee_tcb_svn` | operator | The TDX module version is the host's |
-| `rtmr0`-`rtmr3` | zero | The image extends no RTMR, so a later extension stays visible |
+| `mrtd` | the measurement | — |
+| `mrconfigid` | `--config-hash` | Passed by the host at launch, but chosen by this build |
+| `rtmr0`-`rtmr3` | zero at launch | The image extends none, so anything the guest extends later stays visible |
 
 SEV-SNP:
 
-| Field | Required | Why the digest cannot carry it |
+| Field | Value | Why the digest cannot carry it |
 | --- | --- | --- |
-| `policy` | `0x30133` | The report records the policy the host asked for |
-| `host_data` | `--config-hash` | Passed by the host at launch |
-| `guest_svn` | `--guest-svn` | The only version this image carries |
-| `family_id`, `image_id` | zero | Signed as zero in the ID block |
-| `vmpl` | `0` | The guest runs at VMPL0 |
-| `platform_info_smt_en` | `false` | The guest policy cannot refuse SMT |
-| `platform_info_rapl_dis` | `true` | RAPL turns guest power draw into a side channel, and the host decides whether it runs |
-| `platform_info_ciphertext_hiding_en` | operator | Not every platform offers it |
-| `signer_info_mask_chip_key` | `false` | A masked chip key unroots the report from this CPU |
+| `measurement` | the launch digest | — |
+| `policy` | `0x30133` | The file asks for it; only a signed ID block makes the firmware refuse a launch that used another |
+| `host_data` | `--config-hash` | Passed by the host at launch, but chosen by this build |
+| `guest_svn` | `--guest-svn`, and zero unless `--id-key` signs one | An unsigned launch reports zero, so a non-zero SVN without a key is refused |
 | `id_key_digest` | the `--id-key` digest, else zero | Zero says the firmware enforced no digest at launch |
-| `author_key_digest` | zero | This image uses no author key |
-| `reported_tcb` | operator | The platform TCB is the host's |
+
+Every other report field describes the **machine**, not the image: TDX
+`ATTRIBUTES`, `XFAM`, `MROWNER`, `MROWNERCONFIG`, `SERVTD_HASH` and
+`TEE_TCB_SVN`; SEV-SNP `PLATFORM_INFO`, `SIGNER_INFO`, `REPORTED_TCB`, `VMPL`,
+and the identity fields an unsigned launch leaves to the host. This build cannot
+observe any of them, so it does not state them. They belong to the verifier's
+platform policy, alongside the trusted computing base floors and the endorsed
+machine identities.
+
+Two consequences are worth stating plainly, because the digest hides them:
+
+- A TD launched with `DEBUG` or `MIGRATABLE` set produces a byte-identical
+  MRTD. Only a policy that pins `ATTRIBUTES` catches it.
+- This image's guest policy allows simultaneous multithreading because KVM
+  refuses to launch a guest whose policy forbids it, so whether the host
+  actually runs it is visible only in `PLATFORM_INFO`.
 
 ## Reproducible build
 
