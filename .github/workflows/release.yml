@@ -46,15 +46,14 @@ jobs:
         with:
           nix_version: "2.32.3"
 
+      # Not built twice here. A second build on this runner would only catch a
+      # derivation that is nondeterministic in itself, which the sandbox already
+      # makes unlikely; it cannot speak for a different machine, which is the
+      # property that matters and the one the pinned toolchain exists for.
+      # Reproducibility is demonstrated by somebody else rebuilding this digest,
+      # which is what the release notes ask for.
       - name: Build
         run: nix-build
-
-      # A release nobody can rebuild to the same bytes would defeat the point of
-      # publishing it. This compares two builds on this runner, which catches a
-      # derivation that is nondeterministic in itself; it cannot speak for a
-      # different machine, which is what the pinned toolchain is for.
-      - name: Rebuild and compare
-        run: nix-build --check
 
       - name: Stage the artifact
         run: |

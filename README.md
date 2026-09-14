@@ -193,9 +193,9 @@ Two consequences are worth stating plainly, because the digest hides them:
 ## Releases
 
 A version tag publishes a `boot-shim` binary and its `boot-shim.sha256`, built
-by `nix-build` and rebuilt to the same bytes before it ships. The binary is
-static, so it runs anywhere; a dynamically linked nix build names an
-interpreter inside the machine that produced it and starts nowhere else.
+by `nix-build`. The binary is static, so it runs anywhere; a dynamically linked
+nix build names an interpreter inside the machine that produced it and starts
+nowhere else.
 
 ```sh
 gh release download v0.1.0 -p 'boot-shim*'
@@ -205,7 +205,16 @@ gh attestation verify boot-shim --repo tinfoilsh/boot-shim
 
 The last command checks the provenance published with the release: that this
 binary came out of this repository's release workflow at that tag, rather than
-from somebody's laptop. To go further, rebuild it and compare the digest.
+from somebody's laptop.
+
+That still trusts the machine that built it. Rebuilding is what removes that
+trust, and it is worth something only from a machine that is not the one that
+published the release:
+
+```sh
+git clone --branch v0.1.0 https://github.com/tinfoilsh/boot-shim && cd boot-shim
+nix-build && sha256sum result/bin/boot-shim
+```
 
 ## Reproducible build
 
