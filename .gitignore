@@ -14,3 +14,6 @@ coverage
 .idea
 # vscode working directory
 .vscode
+
+# nix build output
+result

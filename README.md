@@ -190,6 +190,23 @@ Two consequences are worth stating plainly, because the digest hides them:
   refuses to launch a guest whose policy forbids it, so whether the host
   actually runs it is visible only in `PLATFORM_INFO`.
 
+## Releases
+
+A version tag publishes a `boot-shim` binary and its `boot-shim.sha256`, built
+by `nix-build` and rebuilt to the same bytes before it ships. The binary is
+static, so it runs anywhere; a dynamically linked nix build names an
+interpreter inside the machine that produced it and starts nowhere else.
+
+```sh
+gh release download v0.1.0 -p 'boot-shim*'
+sha256sum -c boot-shim.sha256
+gh attestation verify boot-shim --repo tinfoilsh/boot-shim
+```
+
+The last command checks the provenance published with the release: that this
+binary came out of this repository's release workflow at that tag, rather than
+from somebody's laptop. To go further, rebuild it and compare the digest.
+
 ## Reproducible build
 
 `cargo build` pins rustc and nothing else. rustc hands the final link to `cc`,
@@ -198,8 +215,9 @@ running the same pinned rustc produced different binaries from identical
 source, differing only in gcc 15.2 against 13.3, binutils 2.46 against 2.42,
 and glibc 2.43 against 2.39.
 
-`default.nix` pins all of them, at the nixpkgs revision cvmimage builds
-against:
+`default.nix` pins all of them at one nixpkgs revision, and builds statically
+so that the binary a release publishes is the binary this file builds and
+tests:
 
 ```sh
 nix-build              # -> result/bin/boot-shim

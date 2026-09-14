@@ -8,7 +8,7 @@
 # glibc 2.43 vs 2.39.
 #
 # The nixpkgs revision below pins all of them together, and is the same
-# revision cvmimage builds against, so the two agree on a toolchain.
+# revision the guest image builds against, so the two agree on a toolchain.
 #
 #   nix-build            # -> result/bin/boot-shim
 #
@@ -41,12 +41,15 @@ let
   # mismatch a build failure rather than two "pinned" builds quietly using
   # different compilers, which is what happened before it existed.
   toolchain = builtins.replaceStrings [ "\n" ] [ "" ] (builtins.readFile ./rust-toolchain);
+  cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
 in
 assert pkgs.lib.assertMsg (pkgs.rustc.version == toolchain)
   "rust-toolchain pins ${toolchain} but this nixpkgs provides rustc ${pkgs.rustc.version}";
 pkgs.pkgsStatic.rustPlatform.buildRustPackage {
   pname = "boot-shim";
-  version = "0.1.0";
+  # Read from the manifest rather than repeated here: a second copy would let a
+  # release name one version and build a store path called another.
+  inherit (cargoToml.package) version;
 
   # Keep build outputs out of the source hash, or every local cargo build
   # invalidates the derivation.
