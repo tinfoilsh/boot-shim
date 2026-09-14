@@ -15,6 +15,11 @@
 # This matters because the output of this binary is a measurement. Anyone
 # asked to trust an expected_mrtd should be able to rebuild the thing that
 # computed it and get the same bytes.
+#
+# The build is static, because the binary is published for other machines to
+# run. A dynamically linked one names an interpreter inside this store and will
+# not start anywhere else, which would leave the artifact people download
+# different from the artifact this file builds and tests.
 {
   system ? "x86_64-linux",
 }:
@@ -39,7 +44,7 @@ let
 in
 assert pkgs.lib.assertMsg (pkgs.rustc.version == toolchain)
   "rust-toolchain pins ${toolchain} but this nixpkgs provides rustc ${pkgs.rustc.version}";
-pkgs.rustPlatform.buildRustPackage {
+pkgs.pkgsStatic.rustPlatform.buildRustPackage {
   pname = "boot-shim";
   version = "0.1.0";
 
@@ -73,7 +78,9 @@ pkgs.rustPlatform.buildRustPackage {
 
   # build.rs assembles src/reset.S and src/snp_reset.S with GNU as and
   # objcopy. Those bytes land in the measured shim page, so the assembler is
-  # part of the measurement and has to be pinned like everything else.
+  # part of the measurement and has to be pinned like everything else. These
+  # run on the build machine, so they come from the native package set rather
+  # than the static one.
   nativeBuildInputs = [ pkgs.binutils ];
 
   # The suite covers image determinism (byte-identical IGVM output) and the
