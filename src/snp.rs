@@ -3,7 +3,7 @@ use crate::{
     boot::{self, put32, put64, Fill, Placed, ACPI, RAM, RESERVED},
     image::{
         component, components, config_field, identity_map, io_error, mmio_holes, page_directive,
-        prepare, shim, shim_owned, write_manifest, zeros, Component, Required,
+        prepare, shim, shim_owned, write_manifest, zeros, Component, Launch,
     },
     layout::*,
 };
@@ -103,7 +103,7 @@ struct Manifest {
     c_bit_position: u8,
     sev_features: String,
     shim_owned_bytes: usize,
-    attestation: Required,
+    launch: Launch,
     components: BTreeMap<&'static str, Component>,
 }
 
@@ -116,6 +116,12 @@ pub fn build(
     id_key: Option<&Path>,
     guest_svn: u32,
 ) -> Result<(), String> {
+    // An SVN reaches the guest only inside a signed ID block. Without one the
+    // firmware reports zero, so accepting a number here would put a value in
+    // the manifest that no honest launch of this image can produce.
+    if guest_svn != 0 && id_key.is_none() {
+        return Err("--guest-svn needs --id-key: an unsigned launch reports SVN 0".into());
+    }
     let host_data = config_field(config_hash, 32)?;
     let p = prepare(kernel_path, initramfs_path, params)?;
     let acpi = acpi::build(params.vcpus, false);
@@ -266,7 +272,7 @@ pub fn build(
         components.insert("vmsa_ap", component(SNP_VMSA, &ap_page));
     }
     let manifest = Manifest {
-        format_version: 1,
+        format_version: 2,
         platform: "sev-snp",
         memory_bytes: params.memory,
         topology: Topology {
@@ -283,7 +289,7 @@ pub fn build(
         c_bit_position: params.cbit,
         sev_features: format!("0x{SNP_SEV_FEATURES:016x}"),
         shim_owned_bytes: owned,
-        attestation: snp_attestation(&measurement, host_data, guest_svn, signed),
+        launch: snp_launch(&measurement, host_data, guest_svn, signed),
         components,
     };
     write_manifest(output, &manifest)
@@ -354,34 +360,26 @@ fn key_digest(public: &IGVM_VHS_SNP_ID_BLOCK_PUBLIC_KEY) -> [u8; 48] {
     Sha384::digest(sev_key).into()
 }
 
-// The launch digest covers the pages and the VMSA; every other field is required here.
-fn snp_attestation(
+// What a verifier should expect the report to say for this image: the digest,
+// and the launch values this build chose. PLATFORM_INFO, SIGNER_INFO,
+// REPORTED_TCB and VMPL describe the machine instead, so they belong to the
+// verifier's platform policy and are not stated here.
+fn snp_launch(
     measurement: &[u8; 48],
     host_data: String,
     guest_svn: u32,
     signed: Option<[u8; 48]>,
-) -> Required {
-    let mut r = Required::new();
-    r.insert("measurement", Some(hex::encode(measurement)));
-    r.insert("policy", Some(format!("0x{SNP_GUEST_POLICY:016x}")));
-    r.insert("vmpl", Some("0".into()));
-    r.insert("family_id", Some(zeros(16)));
-    r.insert("image_id", Some(zeros(16)));
-    r.insert("guest_svn", Some(guest_svn.to_string()));
-    r.insert("host_data", Some(host_data));
-    // The policy cannot forbid SMT, so PLATFORM_INFO is where the report records it.
-    r.insert("platform_info_smt_en", Some("false".into()));
-    // RAPL turns guest power draw into a side channel, and the host decides whether it runs.
-    r.insert("platform_info_rapl_dis", Some("true".into()));
-    // Ciphertext hiding keeps the host out of guest ciphertext; not every platform offers it.
-    r.insert("platform_info_ciphertext_hiding_en", None);
-    // A masked chip key unroots the report from this CPU, leaving every other check unfounded.
-    r.insert("signer_info_mask_chip_key", Some("false".into()));
-    // Both digests zero says the firmware compared its launch digest against nothing.
-    r.insert("id_key_digest", Some(signed.map_or(zeros(48), hex::encode)));
-    r.insert("author_key_digest", Some(zeros(48)));
-    // The platform TCB is the host's, so the operator pins an acceptable floor.
-    r.insert("reported_tcb", None);
+) -> Launch {
+    let mut r = Launch::new();
+    r.insert("measurement", hex::encode(measurement));
+    // The file asks for this policy, but only a signed ID block makes the
+    // firmware refuse a launch that used a different one, so a verifier has to
+    // pin it either way.
+    r.insert("policy", format!("0x{SNP_GUEST_POLICY:016x}"));
+    r.insert("guest_svn", guest_svn.to_string());
+    r.insert("host_data", host_data);
+    // Zero says the firmware compared its launch digest against nothing.
+    r.insert("id_key_digest", signed.map_or(zeros(48), hex::encode));
     r
 }
 
@@ -886,15 +884,60 @@ mod tests {
         assert_eq!(one, fs::read(&out).unwrap());
     }
 
-    /// The policy cannot express these and the digest does not cover them.
+    /// An SVN travels in the ID block or not at all, so accepting one without
+    /// a key would publish a number the firmware never reports.
     #[test]
-    fn snp_attestation_pins_what_the_policy_cannot() {
-        let r = snp_attestation(&[0u8; 48], zeros(32), 0, None);
-        assert_eq!(r["platform_info_smt_en"], Some("false".into()));
-        assert_eq!(r["platform_info_rapl_dis"], Some("true".into()));
-        assert_eq!(r["signer_info_mask_chip_key"], Some("false".into()));
-        assert_eq!(r["platform_info_ciphertext_hiding_en"], None);
-        assert_eq!(r["id_key_digest"], Some(zeros(48)));
-        assert_eq!(r["author_key_digest"], Some(zeros(48)));
+    fn an_unsigned_image_refuses_a_nonzero_guest_svn() {
+        let dir = tempdir().unwrap();
+        let (k, i) = (dir.path().join("bzImage"), dir.path().join("initrd"));
+        fs::write(&k, test_kernel()).unwrap();
+        fs::write(&i, vec![7u8; 1000]).unwrap();
+        let out = dir.path().join("o.igvm");
+        let err = build(&k, &i, &out, &params(), None, None, 3).unwrap_err();
+        assert!(err.contains("--guest-svn needs --id-key"), "{err}");
+        // Zero is what an unsigned launch reports, so it stays allowed.
+        build(&k, &i, &out, &params(), None, None, 0).unwrap();
+    }
+
+    /// The manifest describes the image. What the machine happens to be is the
+    /// verifier's platform policy, and asserting it from a build artifact
+    /// would be asserting something this build cannot observe.
+    #[test]
+    fn the_launch_block_states_nothing_the_host_chooses() {
+        let r = snp_launch(&[0u8; 48], zeros(32), 0, None);
+        for host_chosen in [
+            "platform_info_smt_en",
+            "platform_info_rapl_dis",
+            "platform_info_ciphertext_hiding_en",
+            "signer_info_mask_chip_key",
+            "reported_tcb",
+            "vmpl",
+            "family_id",
+            "image_id",
+            "author_key_digest",
+        ] {
+            assert!(!r.contains_key(host_chosen), "{host_chosen} is the host's");
+        }
+        // An exact set, so a newly added host field fails even though no
+        // denylist names it.
+        assert_eq!(
+            r.keys().copied().collect::<Vec<_>>(),
+            [
+                "guest_svn",
+                "host_data",
+                "id_key_digest",
+                "measurement",
+                "policy"
+            ]
+        );
+        // What is left is what a different image would change.
+        assert_eq!(r["measurement"], zeros(48));
+        assert_eq!(r["policy"], format!("0x{SNP_GUEST_POLICY:016x}"));
+        assert_eq!(r["host_data"], zeros(32));
+        assert_eq!(r["guest_svn"], "0");
+        // Zero here says the firmware enforced no digest at launch.
+        assert_eq!(r["id_key_digest"], zeros(48));
+        let signed = snp_launch(&[0u8; 48], zeros(32), 0, Some([7u8; 48]));
+        assert_eq!(signed["id_key_digest"], hex::encode([7u8; 48]));
     }
 }

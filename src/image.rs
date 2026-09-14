@@ -22,8 +22,10 @@ pub struct Component {
     size: usize,
     sha256: String,
 }
-// Report fields a verifier requires besides the measurement; `None` is the operator's to pin.
-pub type Required = BTreeMap<&'static str, Option<String>>;
+// What a verifier should expect the report to say for this image: the digest,
+// and the launch values this build chose. A value the host passes in is stated
+// here when this build picked it, and left out when only the machine knows it.
+pub type Launch = BTreeMap<&'static str, String>;
 
 pub fn zeros(bytes: usize) -> String {
     "00".repeat(bytes)
@@ -57,7 +59,7 @@ struct Manifest {
     kernel_entry: String,
     expected_mrtd: String,
     shim_owned_bytes: usize,
-    attestation: Required,
+    launch: Launch,
     components: BTreeMap<&'static str, Component>,
 }
 
@@ -221,7 +223,7 @@ pub fn build(
     fs::write(output, &file).map_err(io_error("write IGVM"))?;
 
     let manifest = Manifest {
-        format_version: 1,
+        format_version: 2,
         platform: "tdx",
         memory_bytes: params.memory,
         vcpus: params.vcpus,
@@ -230,7 +232,7 @@ pub fn build(
         kernel_entry: format!("0x{:08x}", p.entry),
         expected_mrtd: hex::encode(expected_mrtd),
         shim_owned_bytes: owned,
-        attestation: tdx_attestation(&expected_mrtd, mrconfigid),
+        launch: tdx_launch(&expected_mrtd, mrconfigid),
         components: components(&placed),
     };
     write_manifest(output, &manifest)
@@ -327,30 +329,16 @@ pub fn igvm_pages(file: &[u8]) -> Result<Vec<(u64, Vec<u8>)>, String> {
         .collect()
 }
 
-// The TD_ATTRIBUTES bits a verifier constrains; the compare is masked, so the rest stay free.
-const ATTR_DEBUG: u64 = 1;
-const ATTR_SEPT_VE_DISABLE: u64 = 1 << 28;
-const ATTR_MIGRATABLE: u64 = 1 << 29;
-
-// MRTD covers the pages; the host picks ATTRIBUTES, XFAM and the owner registers separately.
-fn tdx_attestation(mrtd: &[u8; 48], mrconfigid: String) -> Required {
-    let mut r = Required::new();
-    r.insert("mrtd", Some(hex::encode(mrtd)));
-    let mask = ATTR_DEBUG | ATTR_SEPT_VE_DISABLE | ATTR_MIGRATABLE;
-    r.insert("attributes_mask", Some(format!("0x{mask:016x}")));
-    r.insert("attributes", Some(format!("0x{ATTR_SEPT_VE_DISABLE:016x}")));
-    // XFAM is a launch parameter this build cannot predict.
-    r.insert("xfam", None);
-    r.insert("mrconfigid", Some(mrconfigid));
-    r.insert("mrowner", Some(zeros(48)));
-    r.insert("mrownerconfig", Some(zeros(48)));
-    // Zero says no service TD is bound, and a TD migrates only through a migration TD.
-    r.insert("servtd_hash", Some(zeros(48)));
-    // The module version is the host's, so the operator pins an acceptable floor.
-    r.insert("tee_tcb_svn", None);
+// What a TD launched from this image reports. ATTRIBUTES, XFAM, the owner
+// registers, SERVTD_HASH and TEE_TCB_SVN are the host's to choose at
+// TDH.MNG.INIT, so they belong to the verifier's platform policy, not here.
+fn tdx_launch(mrtd: &[u8; 48], mrconfigid: String) -> Launch {
+    let mut r = Launch::new();
+    r.insert("mrtd", hex::encode(mrtd));
+    r.insert("mrconfigid", mrconfigid);
     // This image extends no RTMR, so each register is still at its reset value.
     for name in ["rtmr0", "rtmr1", "rtmr2", "rtmr3"] {
-        r.insert(name, Some(zeros(48)));
+        r.insert(name, zeros(48));
     }
     r
 }
@@ -683,22 +671,34 @@ pub mod tests {
             .any(|(base, size, kind)| *base == RESET_ALIAS && *size == PAGE && *kind == RESERVED));
     }
 
-    /// DEBUG and MIGRATABLE leave MRTD byte-identical, so the requirement lives here.
+    /// The manifest describes the image. Anything the host picks at
+    /// TDH.MNG.INIT is the verifier's platform policy, and stating it here
+    /// would put a build artifact in the business of asserting host facts.
     #[test]
-    fn attestation_pins_the_attributes_mrtd_cannot() {
-        let r = tdx_attestation(&[0u8; 48], zeros(48));
-        let bits = |key: &str| {
-            u64::from_str_radix(r[key].as_deref().unwrap().trim_start_matches("0x"), 16).unwrap()
-        };
-        let (mask, want) = (bits("attributes_mask"), bits("attributes"));
-        for bit in [ATTR_DEBUG, ATTR_MIGRATABLE] {
-            assert_eq!(mask & bit, bit, "{bit:#x} is not checked");
-            assert_eq!(want & bit, 0, "{bit:#x} is not required clear");
+    fn the_launch_block_states_nothing_the_host_chooses() {
+        let r = tdx_launch(&[7u8; 48], zeros(48));
+        for host_chosen in [
+            "attributes",
+            "attributes_mask",
+            "xfam",
+            "mrowner",
+            "mrownerconfig",
+            "servtd_hash",
+            "tee_tcb_svn",
+        ] {
+            assert!(!r.contains_key(host_chosen), "{host_chosen} is the host's");
         }
-        assert_eq!(want & ATTR_SEPT_VE_DISABLE, ATTR_SEPT_VE_DISABLE);
-        // A masked compare: nothing is demanded outside the mask.
-        assert_eq!(want & !mask, 0);
-        assert_eq!(r["servtd_hash"], Some(zeros(48)));
-        assert_eq!(r["tee_tcb_svn"], None);
+        // An exact set, so a newly added host field fails even though no
+        // denylist names it.
+        assert_eq!(
+            r.keys().copied().collect::<Vec<_>>(),
+            ["mrconfigid", "mrtd", "rtmr0", "rtmr1", "rtmr2", "rtmr3"]
+        );
+        // Distinct values, so the two cannot be swapped without failing.
+        assert_eq!(r["mrtd"], hex::encode([7u8; 48]));
+        assert_eq!(r["mrconfigid"], zeros(48));
+        for rtmr in ["rtmr0", "rtmr1", "rtmr2", "rtmr3"] {
+            assert_eq!(r[rtmr], zeros(48), "{rtmr} is not a reset value");
+        }
     }
 }
