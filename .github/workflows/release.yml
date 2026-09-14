@@ -28,7 +28,14 @@ jobs:
 
       # A tag names a version people pin, so it must not be able to claim one
       # the crate does not report, and it must not point somewhere off main.
+      #
+      # Whether the commit is on main is asked over the API rather than with
+      # git: the checkout above keeps no credentials on disk, so a fetch here
+      # would have nothing to authenticate with, and putting them back would
+      # leave a repository-write token readable for the whole build.
       - name: Check the tag
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           crate="v$(sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml | head -1)"
@@ -36,11 +43,14 @@ jobs:
             echo "::error::tag $GITHUB_REF_NAME does not match crate version $crate"
             exit 1
           fi
-          git fetch --depth=100 origin main
-          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
-            echo "::error::$GITHUB_REF_NAME is not on main"
-            exit 1
-          fi
+          status="$(gh api "repos/$GITHUB_REPOSITORY/compare/main...$GITHUB_SHA" -q .status)"
+          case "$status" in
+            identical | behind) ;;
+            *)
+              echo "::error::$GITHUB_REF_NAME is not on main (compare says $status)"
+              exit 1
+              ;;
+          esac
 
       - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
         with:
