@@ -485,6 +485,72 @@ pub mod tests {
         assert!(Params::tdx(DEFAULT_RAM, MAX_VCPUS + 1, "", vec![]).is_err());
     }
 
+    /// Every input the measurement is claimed to cover must move it. An input
+    /// that can change while the digest stays put has silently fallen outside
+    /// the measurement, and every check downstream still passes -- an image
+    /// that no longer commits to its own kernel still verifies. That is the
+    /// failure this whole design exists to make impossible, and it is invisible
+    /// unless something asserts it.
+    #[test]
+    fn changing_any_measured_input_moves_the_measurement() {
+        let dir = tempdir().unwrap();
+        let kernel = dir.path().join("bzImage");
+        let initramfs = dir.path().join("initrd");
+        fs::write(&kernel, test_kernel()).unwrap();
+        fs::write(&initramfs, vec![7u8; 100_000]).unwrap();
+        let cmdline = "root=/dev/mapper/root roothash=aa11";
+
+        let mrtd = |k: &Path, i: &Path, c: &str, vcpus: u32| -> String {
+            let out = dir.path().join("out.igvm");
+            let params = Params::tdx(DEFAULT_RAM, vcpus, c, vec![]).unwrap();
+            build(k, i, &out, &params, None).unwrap();
+            let manifest = fs::read(format!("{}.manifest.json", out.display())).unwrap();
+            let manifest: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
+            manifest["expected_mrtd"].as_str().unwrap().to_owned()
+        };
+
+        let base = mrtd(&kernel, &initramfs, cmdline, DEFAULT_VCPUS);
+        // A baseline that moved on its own would make every assertion below
+        // pass for the wrong reason.
+        assert_eq!(base, mrtd(&kernel, &initramfs, cmdline, DEFAULT_VCPUS));
+
+        let other = dir.path().join("bzImage.other");
+        let mut bytes = test_kernel();
+        bytes[4096] ^= 1;
+        fs::write(&other, bytes).unwrap();
+        let moved = mrtd(&other, &initramfs, cmdline, DEFAULT_VCPUS);
+        assert_ne!(
+            base, moved,
+            "one byte of the kernel left the measurement alone"
+        );
+
+        let other = dir.path().join("initrd.other");
+        let mut bytes = vec![7u8; 100_000];
+        bytes[1000] ^= 1;
+        fs::write(&other, bytes).unwrap();
+        let moved = mrtd(&kernel, &other, cmdline, DEFAULT_VCPUS);
+        assert_ne!(
+            base, moved,
+            "one byte of the initramfs left the measurement alone"
+        );
+
+        // One hex digit of the root hash. The command line is what binds the
+        // image to a root filesystem, so this is the mutation that matters most.
+        let moved = mrtd(
+            &kernel,
+            &initramfs,
+            "root=/dev/mapper/root roothash=ab11",
+            DEFAULT_VCPUS,
+        );
+        assert_ne!(base, moved, "the command line left the measurement alone");
+
+        let moved = mrtd(&kernel, &initramfs, cmdline, DEFAULT_VCPUS + 1);
+        assert_ne!(
+            base, moved,
+            "the processor count left the measurement alone"
+        );
+    }
+
     /// Builds from stub inputs and returns the IGVM file and the manifest beside it.
     pub fn built(params: &Params) -> (Vec<u8>, serde_json::Value) {
         let dir = tempdir().unwrap();
