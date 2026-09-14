@@ -30,7 +30,8 @@ struct Common {
     /// Guest RAM the host must match, in 0x hex or with a K/M/G suffix.
     #[arg(long, default_value_t = DEFAULT_RAM, value_parser = parse_size)]
     ram: u64,
-    /// Linux command line, measured whole, with `no5lvl` always appended.
+    /// Linux command line, measured whole. The PCI options an IGVM guest needs
+    /// replace any the caller passed, and `no5lvl` is always appended.
     #[arg(long, default_value = "", hide_default_value = true)]
     cmdline: String,
     /// Processor count, which the measured MADT advertises. SNP additionally
