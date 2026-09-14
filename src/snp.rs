@@ -868,6 +868,69 @@ mod tests {
         assert_eq!(kind, Some(RESERVED));
     }
 
+    /// The SNP twin of the TDX coverage test. Kept separate because the two
+    /// platforms build their digests by different methods: TDX extends one
+    /// record per page, SNP hashes pages and then one VMSA per processor, so an
+    /// input can fall out of one without falling out of the other.
+    #[test]
+    fn changing_any_measured_input_moves_the_measurement() {
+        let dir = tempdir().unwrap();
+        let kernel = dir.path().join("bzImage");
+        let initramfs = dir.path().join("initrd");
+        fs::write(&kernel, test_kernel()).unwrap();
+        fs::write(&initramfs, vec![7u8; 100_000]).unwrap();
+        let cmdline = "root=/dev/mapper/root roothash=aa11";
+
+        let digest = |k: &Path, i: &Path, c: &str, vcpus: u32| -> String {
+            let out = dir.path().join("out.igvm");
+            let params = Params::snp(DEFAULT_RAM, vcpus, DEFAULT_CBIT, c, vec![]).unwrap();
+            build(k, i, &out, &params, None, None, 0).unwrap();
+            let manifest = fs::read(format!("{}.manifest.json", out.display())).unwrap();
+            let manifest: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
+            manifest["expected_snp_measurement"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+
+        let base = digest(&kernel, &initramfs, cmdline, DEFAULT_VCPUS);
+        assert_eq!(base, digest(&kernel, &initramfs, cmdline, DEFAULT_VCPUS));
+
+        let other = dir.path().join("bzImage.other");
+        let mut bytes = test_kernel();
+        bytes[4096] ^= 1;
+        fs::write(&other, bytes).unwrap();
+        let moved = digest(&other, &initramfs, cmdline, DEFAULT_VCPUS);
+        assert_ne!(
+            base, moved,
+            "one byte of the kernel left the measurement alone"
+        );
+
+        let other = dir.path().join("initrd.other");
+        let mut bytes = vec![7u8; 100_000];
+        bytes[1000] ^= 1;
+        fs::write(&other, bytes).unwrap();
+        let moved = digest(&kernel, &other, cmdline, DEFAULT_VCPUS);
+        assert_ne!(
+            base, moved,
+            "one byte of the initramfs left the measurement alone"
+        );
+
+        let moved = digest(
+            &kernel,
+            &initramfs,
+            "root=/dev/mapper/root roothash=ab11",
+            DEFAULT_VCPUS,
+        );
+        assert_ne!(base, moved, "the command line left the measurement alone");
+
+        let moved = digest(&kernel, &initramfs, cmdline, DEFAULT_VCPUS + 1);
+        assert_ne!(
+            base, moved,
+            "the processor count left the measurement alone"
+        );
+    }
+
     #[test]
     fn builds_reproducible_parseable_snp_images() {
         let dir = tempdir().unwrap();
