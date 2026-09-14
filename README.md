@@ -79,6 +79,13 @@ qemu-system-x86_64 -accel kvm -m 1G -smp 4 -cpu host \
 
 Do not pass `-bios`, `-kernel`, `-initrd`, or `-append`. Add `console=ttyS0` to `--cmdline` for a serial console.
 
+The measured command line is the one passed to `--cmdline` with `pci=noacpi
+pcie_ports=compat` replacing any `pci=` or `pcie_ports=` it carried, and
+`no5lvl` appended. A deployment's own PCI options are meant for a firmware boot
+and would discard the host bridge windows this image measures. Applying the
+substitution before calling changes nothing, so a caller that already did it
+builds the same image.
+
 Upstream QEMU supports IGVM for SEV, SEV-ES and SEV-SNP, but not TDX. Apply the
 patch in [`qemu-patches/`](qemu-patches) and build QEMU with `--enable-igvm`
 against libigvm 0.3 or newer:

@@ -137,6 +137,44 @@ pub const DEFAULT_CBIT: u8 = 51;
 // The measured page tables are four-level, so this is appended to every command line.
 const REQUIRED_CMDLINE: &str = "no5lvl";
 
+// The PCI options an IGVM guest needs, replacing whatever the caller carried.
+//
+// The image builds the guest its own root complex: a measured MCFG for the q35
+// ECAM window and a PCI0 device whose _CRS declares the host bridge windows.
+// Linux enumerates through ACPI as it would under firmware, so it only has to
+// be told it may assign BARs itself, no firmware having run to do it first. A
+// `pci=nocrs` carried over from a firmware boot would throw away the very
+// windows this image went to the trouble of measuring, so any `pci=` or
+// `pcie_ports=` the caller passed is dropped rather than kept.
+const REQUIRED_PCI: [&str; 2] = ["pci=noacpi", "pcie_ports=compat"];
+
+/// The command line the image measures, built from the one the caller passed.
+///
+/// This lives here, rather than in each caller, because the measured command
+/// line has to be a function of the published one: two builders that disagreed
+/// about the rewrite would compute different digests for the same deployment,
+/// and the mismatch would surface only as a failed attestation. Applying it
+/// twice is the same as applying it once, so a caller that has already done
+/// the substitution still gets the same image.
+fn measured_cmdline(cmdline: &str) -> String {
+    // Every word this function appends is also dropped first, so the options
+    // land in one canonical order however many times it runs. Leaving a word
+    // where the caller put it would reorder it on a second pass, which is a
+    // different command line and so a different measurement.
+    let mut words: Vec<&str> = cmdline
+        .split_whitespace()
+        .filter(|w| {
+            !w.starts_with("pci=") && !w.starts_with("pcie_ports=") && *w != REQUIRED_CMDLINE
+        })
+        .collect();
+    if words.is_empty() {
+        words.push(DEFAULT_CMDLINE);
+    }
+    words.extend(REQUIRED_PCI);
+    words.push(REQUIRED_CMDLINE);
+    words.join(" ")
+}
+
 pub struct Params {
     /// Top of the guest-physical map: low RAM, the PCI aperture and high RAM.
     pub memory: u64,
@@ -184,11 +222,7 @@ impl Params {
         if !(32..=63).contains(&cbit) {
             return Err("--cbit must name a bit in the physical address width".into());
         }
-        let cmdline = match cmdline.trim() {
-            "" => format!("{DEFAULT_CMDLINE} {REQUIRED_CMDLINE}"),
-            c if c.split_whitespace().any(|w| w == REQUIRED_CMDLINE) => c.to_string(),
-            c => format!("{c} {REQUIRED_CMDLINE}"),
-        };
+        let cmdline = measured_cmdline(cmdline);
         if cmdline.bytes().any(|b| b == 0 || !b.is_ascii()) {
             return Err("--cmdline must be printable ASCII".into());
         }

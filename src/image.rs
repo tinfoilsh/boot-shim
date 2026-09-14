@@ -475,14 +475,40 @@ pub mod tests {
 
     #[test]
     fn required_cmdline_is_appended_whatever_the_operator_asks_for() {
-        assert_eq!(params().cmdline, "panic=-1 no5lvl");
+        assert_eq!(
+            params().cmdline,
+            "panic=-1 pci=noacpi pcie_ports=compat no5lvl"
+        );
         let p = Params::tdx(DEFAULT_RAM, 1, "quiet", vec![]).unwrap();
-        assert_eq!(p.cmdline, "quiet no5lvl");
+        assert_eq!(p.cmdline, "quiet pci=noacpi pcie_ports=compat no5lvl");
+        // An operator's own no5lvl is moved to the canonical position, not doubled.
         let p = Params::tdx(DEFAULT_RAM, 1, "no5lvl x", vec![]).unwrap();
-        assert_eq!(p.cmdline, "no5lvl x");
+        assert_eq!(p.cmdline, "x pci=noacpi pcie_ports=compat no5lvl");
         assert!(Params::tdx(DEFAULT_RAM, 0, "", vec![]).is_err());
         assert!(Params::tdx(0x1000, 1, "", vec![]).is_err());
         assert!(Params::tdx(DEFAULT_RAM, MAX_VCPUS + 1, "", vec![]).is_err());
+    }
+
+    /// The rewrite has to be idempotent, because a caller that already did the
+    /// substitution must still measure the same image as one that did not.
+    #[test]
+    fn the_pci_options_replace_whatever_a_firmware_boot_carried() {
+        let line = |c: &str| Params::tdx(DEFAULT_RAM, 1, c, vec![]).unwrap().cmdline;
+        let firmware = "root=/dev/mapper/root pci=realloc,nocrs quiet";
+        let want = "root=/dev/mapper/root quiet pci=noacpi pcie_ports=compat no5lvl";
+        assert_eq!(line(firmware), want);
+        // Applying it again changes nothing, so both callers agree on a digest.
+        assert_eq!(line(&line(firmware)), want);
+        // A stale pcie_ports= is replaced too, not appended beside.
+        assert_eq!(
+            line("quiet pcie_ports=native"),
+            "quiet pci=noacpi pcie_ports=compat no5lvl"
+        );
+        // SNP and TDX measure the same command line.
+        let snp = Params::snp(DEFAULT_RAM, 1, DEFAULT_CBIT, firmware, vec![])
+            .unwrap()
+            .cmdline;
+        assert_eq!(snp, want);
     }
 
     /// Builds from stub inputs and returns the IGVM file and the manifest beside it.
